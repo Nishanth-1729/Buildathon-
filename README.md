@@ -4,33 +4,35 @@ A single Rust binary (no external crates) that implements [rules.md](rules.md): 
 
 ## How it works
 
-| Step | What happens | Code |
+Three parallel passes over cache-sized buckets, then the write. Timestamps are kept as `u32` milliseconds after `window_start - 7 days`.
+
+| Pass | What happens | Code |
 | --- | --- | --- |
-| Read | Every CSV is memory-mapped and cut into 4 MB chunks; a line belongs to the chunk holding its first byte, and each file's first line is its header. | [src/csv.rs](src/csv.rs) |
-| Split | An AVX2 scanner finds `,` `\n` `"` 64 bytes at a time and applies the dialect exactly: whole-field quotes only, `""` is null, `\r` is data, wrong field counts are dropped. A randomized test checks it against a plain scalar splitter. | [src/csv.rs](src/csv.rs) |
-| Values | F1/F2/F3 timestamps with calendar and offset checks, ASCII digits only, i64 overflow treated as out of window. | [src/ts.rs](src/ts.rs) |
-| IDs | IDs up to 15 bytes are packed into a u128 whose integer order is the byte order; longer IDs are interned. Nothing compares by hash alone. | [src/key.rs](src/key.rs) |
-| Links | Parsed and resolved with union-find on their own thread while events are parsed; each person is named by their byte-wise smallest ID. | [src/main.rs](src/main.rs) |
-| Dedup | Event copies are bucketed by `event_id` hash; per bucket, the copy with the smallest `ingest_ts` is kept and only then validated. | [src/main.rs](src/main.rs) |
-| Sessions | Survivors and valid clicks are bucketed by person, sorted by time, split on gaps over 30 minutes, credited by binary search, and assisted by merging each campaign's 7-day click intervals. | [src/main.rs](src/main.rs) |
+| Parse | Every CSV is memory-mapped and cut into 4 MB chunks; a row belongs to the chunk holding its first byte. Each row is classified from the 128 bytes at its own start with AVX2 (commas, newline, quotes); long rows and file tails use the scalar splitter that defines the dialect. Event copies go to 512 buckets by `event_id` hash. The thread that parses the last link chunk resolves linked IDs while the others keep parsing. | [src/csv.rs](src/csv.rs), [src/main.rs](src/main.rs) |
+| Values | F1/F2 timestamps are validated and split with one SSSE3 pass and dated from a month table (1900–2199; other years take the scalar path). F3 has a 13-digit SIMD path. | [src/ts.rs](src/ts.rs) |
+| IDs | Short ASCII IDs pack into a `u64` whose integer order is the byte order; other IDs are interned. Nothing compares by hash alone. | [src/key.rs](src/key.rs) |
+| Links | Union-find over IDs numbered in byte order, with the smaller number always the root, so a component's root is its name. Linked IDs go into an open-addressing table behind a bit filter. | [src/main.rs](src/main.rs) |
+| Dedup + route | Per event bucket, a bitmap proves most `event_id`s unique; repeated bits (collisions included) go through an exact map that keeps the smallest `ingest_ts`. Valid winners and clicks are resolved to their person (prefetched lookups) and sent to 512 person buckets. | [src/main.rs](src/main.rs) |
+| Sessions | Per person bucket: a dense local index and counting sort group events and clicks by person; each person's events are sorted by time, split on gaps over 30 minutes, credited (latest click within 7 days, smallest `click_id` on ties) and assisted (merged 7-day click intervals per campaign). | [src/main.rs](src/main.rs) |
 | Write | A minimal Parquet writer: PLAIN, uncompressed, `day` as `DATE`. | [src/parquet.rs](src/parquet.rs) |
+
+If a dataset is outside this layout's limits (a window too long for `u32` offsets, or more than 254 categories), the previous general pipeline in [src/legacy.rs](src/legacy.rs) runs instead.
 
 ## Results on the dev machine
 
-8 threads pinned with `taskset` (i9-12900K, inputs in the page cache). Scorer times will differ.
+8 threads pinned with `taskset -c 0-7` (4 cores with hyperthreading, i9-12900K, inputs in the page cache). Scorer times will differ.
 
-| Dataset | Events | Wall time | Peak RSS (includes mapped inputs) |
+| Dataset | Events | Wall time | Previous version |
 | --- | --- | --- | --- |
-| dev, seed 1 | 1M | 0.07 s | — |
-| practice size, seed 21 | 20M | 1.33 s | 4.9 GB |
-| final size, seed 61 | 60M | 4.1 s | 13.2 GB |
+| practice size, seed 21 | 20M | 0.56 s | 1.34 s |
+| final size, seed 61 | 60M | 1.76 s | 4.1 s |
 
 ## Verification
 
-- `cargo test --release`: timestamp, dialect and chunk-ownership unit tests, plus the randomized scanner test.
+- `cargo test --release`: dialect, chunk ownership, randomized scanner-vs-reference tests (block scanner and row scanner, 3 and 7 fields), timestamp forms and a randomized timestamp-vs-reference test, ID packing order, dedup collisions.
 - All 36 fixtures pass, natively and in the container.
 - The dev set (seed 1) matches `dev-answer` exactly.
-- [oracle/oracle.py](oracle/oracle.py) is an independent, deliberately plain Python implementation of the rules. It also passes all 36 fixtures and the dev answer, and it agrees with the Rust output exactly on seeds 2, 3, 4 and 7 (1M events), seed 11 (3M) and seed 21 (20M).
+- [oracle/oracle.py](oracle/oracle.py), an independent plain Python implementation, agrees exactly at 20M (seed 21). At 60M (seed 61) the output matches the previous pipeline exactly.
 
 ## Run it
 
