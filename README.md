@@ -59,3 +59,27 @@ make build fixtures DOCKER=podman DOCKER_OPTS="--security-opt label=disable"
 ```
 
 Datasets come from the published generator, for example `generate --seed 21 --events 20000000 --clicks 5000000 --output data/p20m`.
+
+## Parser optimization benchmark
+
+The parser checks CSV quote positions in parallel with BMI2 bit extraction.
+It caches exact calendar-day prefixes near the manifest window and decodes
+common UTC clock fields with validated lookup tables. Other date formats and
+uncached days use the general timestamp parser. The pipeline uses 1,024
+buckets to reduce the working set of each deduplication and session task.
+
+The table compares two profile-guided builds using the same build script.
+Both ran on eight pinned vCPUs on an AMD EPYC 7763 VM. Each row reports the
+median of six timed runs at 20M or four at 60M after one warmup per build,
+with alternating run order. These are local process times.
+
+| Generated input | Base 6474495 | Parser optimization |
+| --- | ---: | ---: |
+| 20M, seed 21 | 0.697 s | 0.667 s |
+| 20M, seed 43 | 0.794 s | 0.757 s |
+| 20M, seed 97 | 0.777 s | 0.677 s |
+| 60M, seed 61 | 3.103 s | 2.800 s |
+
+The profiled binary passes all 36 contest fixtures. Both tables match
+the official dev answer, the Python oracle on a cross-chunk duplicate
+case, and the base commit on the four generated datasets above.

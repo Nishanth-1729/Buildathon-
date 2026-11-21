@@ -197,6 +197,31 @@ fn block(data: &[u8], at: usize) -> (u64, u64, u64) {
 
 pub struct Scanner;
 
+/// Quote flags in field order. A quoted field needs a quote at both ends;
+/// each quote must occupy exactly one of those boundary positions.
+#[cfg(target_feature = "bmi2")]
+#[inline(always)]
+fn field_quotes<const N: usize>(quotes: u128, start: u128, end: u128) -> Option<u32> {
+    use std::arch::x86_64::_pext_u64;
+    let extract = |bits: u128, mask: u128| unsafe {
+        let first = _pext_u64(bits as u64, mask as u64);
+        if N <= 4 {
+            first
+        } else {
+            let second = _pext_u64((bits >> 64) as u64, (mask >> 64) as u64);
+            first | (second << (mask as u64).count_ones())
+        }
+    };
+    let opening = extract(quotes, start);
+    let closing = extract(quotes << 1, end);
+    let double_used = quotes & start & (end >> 1);
+    if opening != closing || double_used != 0 || quotes.count_ones() != 2 * opening.count_ones() {
+        None
+    } else {
+        Some(opening as u32)
+    }
+}
+
 impl Scanner {
     /// Visits the well-formed rows whose first byte is in the chunk.
     #[inline]
@@ -352,23 +377,40 @@ pub fn rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f:
                 if len != 0 && c.count_ones() as usize == N - 1 {
                     let row = &data[at..at + len + 1];
                     let mut s = 0usize;
-                    let mut paired = 0u32;
-                    for (i, dst) in out.iter_mut().enumerate() {
-                        let e = if i == N - 1 { len } else { c.trailing_zeros() as usize };
-                        c &= c.wrapping_sub(1);
-                        let size = e - s;
-                        // Safety: s <= e <= len < row.len(), so both reads and
-                        // the slice are inside the row.
-                        let (left, right) = unsafe { (*row.get_unchecked(s), *row.get_unchecked(e.saturating_sub(1))) };
-                        let q = (size >= 2) & (left == b'"') & (right == b'"');
-                        let t = q as usize;
-                        *dst = unsafe { row.get_unchecked(s + t..e - t) };
-                        paired += 2 * q as u32;
-                        s = e + 1;
+                    #[cfg(target_feature = "bmi2")]
+                    {
+                        if let Some(q) = field_quotes::<N>(quotes & below, (c << 1) | 1, c | (1 << len)) {
+                            for (i, dst) in out.iter_mut().enumerate() {
+                                let e = if i == N - 1 { len } else { c.trailing_zeros() as usize };
+                                c &= c.wrapping_sub(1);
+                                let trim = ((q >> i) & 1) as usize;
+                                // The quote mask allowed only distinct, paired endpoints.
+                                *dst = unsafe { row.get_unchecked(s + trim..e - trim) };
+                                s = e + 1;
+                            }
+                            f(&out);
+                        }
                     }
-                    // Every quote must be one of the pairs around a whole field.
-                    if paired == (quotes & below).count_ones() {
-                        f(&out);
+                    #[cfg(not(target_feature = "bmi2"))]
+                    {
+                        let mut paired = 0u32;
+                        for (i, dst) in out.iter_mut().enumerate() {
+                            let e = if i == N - 1 { len } else { c.trailing_zeros() as usize };
+                            c &= c.wrapping_sub(1);
+                            let size = e - s;
+                            // Safety: s <= e <= len < row.len(), so both reads and
+                            // the slice are inside the row.
+                            let (left, right) = unsafe { (*row.get_unchecked(s), *row.get_unchecked(e.saturating_sub(1))) };
+                            let q = (size >= 2) & (left == b'"') & (right == b'"');
+                            let t = q as usize;
+                            *dst = unsafe { row.get_unchecked(s + t..e - t) };
+                            paired += 2 * q as u32;
+                            s = e + 1;
+                        }
+                        // Every quote must be one of the pairs around a whole field.
+                        if paired == (quotes & below).count_ones() {
+                            f(&out);
+                        }
                     }
                 }
                 at += len + 1;
@@ -390,6 +432,31 @@ pub fn rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quote_boundaries_match_scalar_for_empty_and_malformed_fields() {
+        let values = [b"".as_slice(), b"a", b"\"\"", b"\"a\"", b"\"", b"\"a", b"a\"", b"a\"b", b"\"\"\""];
+        for &first in &values {
+            for &second in &values {
+                for &third in &values {
+                    let mut data = b"header\n".to_vec();
+                    let row = [first, second, third].join(&b',');
+                    data.extend_from_slice(&row);
+                    data.push(b'\n');
+                    data.resize(data.len() + 96, b'x');
+                    let end = b"header\n".len() + row.len() + 1;
+                    let mut expected = [None; 3];
+                    let valid = fields(&row, &mut expected);
+                    let mut seen = false;
+                    rows::<3>(&data, 0, end, |actual| {
+                        assert_eq!(*actual, expected.map(|f| f.unwrap_or(&[])));
+                        seen = true;
+                    });
+                    assert_eq!(seen, valid);
+                }
+            }
+        }
+    }
 
     /// `rows` agrees with `lines` + `fields` on random input and chunkings.
     #[test]

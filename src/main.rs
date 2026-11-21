@@ -34,7 +34,7 @@ use ts::DAY;
 const DAY32: u32 = 86_400_000;
 const GAP: u32 = 1_800_000;
 const REACH: u32 = 7 * DAY32;
-const BUCKETS: usize = 512;
+const BUCKETS: usize = 1024;
 /// Up to this many sessions, assists are found session by session.
 const FEW_SESSIONS: usize = 12;
 const CHUNK: usize = 4 << 20;
@@ -114,6 +114,7 @@ struct Counts {
 
 struct Lookups {
     ids: Interner,
+    time: ts::WindowParser,
     window_start: i64,
     window_end: i64,
     /// window_start - 7 days; every kept timestamp is base + a u32.
@@ -155,7 +156,7 @@ fn run<S: Send>(threads: usize, tasks: usize, init: impl Fn() -> S + Sync, work:
 
 #[inline(always)]
 fn bucket(k: Key) -> usize {
-    (hash(k) >> 55) as usize % BUCKETS
+    (hash(k) >> (64 - BUCKETS.trailing_zeros())) as usize
 }
 
 fn manifest_time(text: &str, name: &str) -> i64 {
@@ -258,6 +259,7 @@ fn lookups(data: &Path) -> Option<Lookups> {
     let days = ((window_end - 1).div_euclid(DAY) - first_day + 1).max(1) as usize;
     Some(Lookups {
         ids,
+        time: ts::WindowParser::new(base, window_end),
         window_start,
         window_end,
         base,
@@ -493,13 +495,13 @@ fn parse_event(f: &[&[u8]; 7], lk: &Lookups, out: &mut [Bucket<Raw>], slab: &mut
     if f[0].is_empty() {
         return;
     }
-    let ingest = ts::parse_f1_first(f[3]).unwrap_or(i64::MAX);
+    let ingest = lk.time.parse_f1_first(f[3]).unwrap_or(i64::MAX);
     let mut raw = Raw { eid: lk.ids.key(f[0]), uid: 0, ingest, ts: INVALID, pc: 0 };
     'valid: {
         if f[1].is_empty() || f[5].is_empty() {
             break 'valid;
         }
-        let Some(ts) = ts::parse(f[2]) else { break 'valid };
+        let Some(ts) = lk.time.parse(f[2]) else { break 'valid };
         if ts < lk.window_start || ts >= lk.window_end || ingest.saturating_sub(ts) > DAY {
             break 'valid;
         }
@@ -548,7 +550,7 @@ fn parse_click(f: &[&[u8]; 4], lk: &Lookups, out: &mut Bucket<Click>, slab: &mut
     if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
         return;
     }
-    let Some(ts) = ts::parse(f[3]) else { return };
+    let Some(ts) = lk.time.parse(f[3]) else { return };
     if ts < lk.base || ts >= lk.window_end {
         return;
     }

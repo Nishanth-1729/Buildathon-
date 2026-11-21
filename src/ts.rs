@@ -186,6 +186,162 @@ fn parse_cold(s: &[u8]) -> Option<i64> {
     parse(s)
 }
 
+/// Exact day prefixes for the dates near this dataset's time window.
+#[derive(Clone, Copy, Default)]
+struct DatePrefix {
+    head: u64,
+    tail: u32,
+    midnight: i64,
+}
+
+pub struct WindowParser {
+    dates: [DatePrefix; 64],
+}
+
+impl WindowParser {
+    pub fn new(base: i64, end: i64) -> Self {
+        let mut dates = [DatePrefix::default(); 64];
+        let first = base.div_euclid(DAY).saturating_sub(1).max(days_from_civil(0, 1, 1));
+        let last = end.div_euclid(DAY).saturating_add(5).min(days_from_civil(9999, 12, 31));
+        if first <= last {
+            let mut year = 0;
+            let mut upper = 10_000;
+            while upper - year > 1 {
+                let mid = (year + upper) / 2;
+                if days_from_civil(mid, 1, 1) <= first {
+                    year = mid;
+                } else {
+                    upper = mid;
+                }
+            }
+            let mut month = 1;
+            while month < 12 && days_from_civil(year, month + 1, 1) <= first {
+                month += 1;
+            }
+            let mut day = first - days_from_civil(year, month, 1) + 1;
+            for epoch_day in first..=last {
+                let bytes = format!("{year:04}-{month:02}-{day:02}T").into_bytes();
+                let index = date_slot(bytes[8], bytes[9]);
+                // A repeated day of month can replace a slot. The exact
+                // prefix check sends the displaced date to the general parser.
+                dates[index] = DatePrefix {
+                    head: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                    tail: u32::from_le_bytes([bytes[8], bytes[9], b'T', 0]),
+                    midnight: epoch_day * DAY,
+                };
+                day += 1;
+                if day > days_in_month(year, month) {
+                    day = 1;
+                    month += 1;
+                    if month == 13 {
+                        month = 1;
+                        year += 1;
+                    }
+                }
+            }
+        }
+        Self { dates }
+    }
+
+    #[inline(always)]
+    fn cached_f1(&self, iso: &[u8; 20]) -> Option<i64> {
+        #[cfg(target_feature = "bmi2")]
+        {
+            let date = self.dates[date_slot(iso[8], iso[9])];
+            let head = u64::from_le_bytes(iso[..8].try_into().unwrap());
+            let tail = u32::from_le_bytes(iso[8..12].try_into().unwrap()) & 0xff_ffff;
+            if date.head == head && date.tail == tail && date.tail != 0 {
+                return utc_millis(iso).map(|offset| date.midnight + offset);
+            }
+        }
+        #[cfg(not(target_feature = "bmi2"))]
+        let _ = iso;
+        None
+    }
+
+    #[inline(always)]
+    pub fn parse(&self, field: &[u8]) -> Option<i64> {
+        if let Ok(iso) = <&[u8; 20]>::try_from(field) {
+            if let Some(time) = self.cached_f1(iso) {
+                return Some(time);
+            }
+        }
+        parse(field)
+    }
+
+    #[inline(always)]
+    pub fn parse_f1_first(&self, field: &[u8]) -> Option<i64> {
+        if let Ok(iso) = <&[u8; 20]>::try_from(field) {
+            if let Some(time) = self.cached_f1(iso) {
+                return Some(time);
+            }
+        }
+        parse_f1_first(field)
+    }
+}
+
+#[inline(always)]
+fn date_slot(a: u8, b: u8) -> usize {
+    (((a & 3) << 4) | (b & 15)) as usize
+}
+
+#[cfg(target_feature = "bmi2")]
+const fn clock_units(maximum: u32, scale: u32) -> [u32; 256] {
+    let mut units = [u32::MAX; 256];
+    let mut value = 0;
+    while value <= maximum {
+        units[((value % 10) * 16 + value / 10) as usize] = value * scale;
+        value += 1;
+    }
+    units
+}
+
+#[cfg(target_feature = "bmi2")]
+#[inline(always)]
+fn utc_millis(iso: &[u8; 20]) -> Option<i64> {
+    static HOUR: [u32; 256] = clock_units(23, 3_600_000);
+    static MINUTE: [u32; 256] = clock_units(59, 60_000);
+    static SECOND: [u32; 256] = clock_units(59, 1_000);
+    let clock = u64::from_le_bytes(iso[11..19].try_into().unwrap());
+    const NIBBLES: u64 = 0x0f0f_000f_0f00_0f0f;
+    const TEMPLATE: u64 = u64::from_le_bytes(*b"00:00:00");
+    if (clock & !NIBBLES != TEMPLATE) | (iso[19] != b'Z') {
+        return None;
+    }
+    // The checked high nibbles are all ASCII '3'. Each lookup rejects
+    // invalid low nibbles and validates the respective clock range.
+    let packed = unsafe { std::arch::x86_64::_pext_u64(clock, NIBBLES) };
+    let hour = HOUR[packed as u8 as usize];
+    let minute = MINUTE[(packed >> 8) as u8 as usize];
+    let second = SECOND[(packed >> 16) as u8 as usize];
+    if (hour | minute | second) == u32::MAX {
+        return None;
+    }
+    Some(i64::from(hour + minute + second))
+}
+
+#[cfg(test)]
+#[test]
+fn window_parser_matches_general_parser_across_calendar_boundaries() {
+    let base = parse(b"2028-02-24T00:00:00Z").unwrap();
+    let end = parse(b"2028-03-30T00:00:00Z").unwrap();
+    let window = WindowParser::new(base, end);
+    for field in [
+        "2028-02-25T03:42:15Z", "2028-03-25T03:42:15Z",
+        "2028-02-29T23:59:59Z", "2028-03-01T00:00:00Z",
+        "2028-02-30T23:59:59Z", "2028-03-01T24:00:00Z",
+        "2028-03-01T00:60:00Z", "2028-03-01T00:00:60Z",
+        "2028-03-01T0?:00:00Z", "2028-03-01T00:00:00z",
+        "2028-03-01T00;00:00Z", "2028-03-01T00:00:00+00:01",
+        "2028-01-01T01:02:03Z", "1843430400000",
+        "00000000000000000001", "０８",
+    ] {
+        let bytes = field.as_bytes();
+        assert_eq!(window.parse(bytes), parse(bytes), "{field}");
+        assert_eq!(window.parse_f1_first(bytes), parse_f1_first(bytes), "{field}");
+    }
+}
+
 /// The previous parser, kept as the reference for the tests.
 #[cfg(test)]
 pub fn parse_reference(s: &[u8]) -> Option<i64> {
