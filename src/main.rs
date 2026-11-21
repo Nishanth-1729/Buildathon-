@@ -35,6 +35,8 @@ const DAY32: u32 = 86_400_000;
 const GAP: u32 = 1_800_000;
 const REACH: u32 = 7 * DAY32;
 const BUCKETS: usize = 512;
+/// Up to this many sessions, assists are found session by session.
+const FEW_SESSIONS: usize = 12;
 const CHUNK: usize = 4 << 20;
 /// `Raw::ts` of an invalid event copy.
 const INVALID: u32 = u32::MAX;
@@ -73,13 +75,26 @@ struct Click {
     campaign: u32,
 }
 
-#[derive(Clone, Copy)]
-struct ClickItem {
-    cid: Key,
-    ts: u32,
-    campaign: u32,
+/// A click of one person as `ts << 96 | cid << 32 | campaign`, so that plain
+/// integer order is (ts, cid) order, unless an ID is interned.
+type ClickItem = u128;
+
+#[inline(always)]
+fn click_ts(c: ClickItem) -> u32 {
+    (c >> 96) as u32
 }
 
+#[inline(always)]
+fn click_campaign(c: ClickItem) -> usize {
+    c as u32 as usize
+}
+
+#[inline(always)]
+fn click_cid(c: ClickItem) -> Key {
+    (c >> 32) as u64
+}
+
+#[derive(Clone, Copy)]
 struct UserRow {
     person: Key,
     day: i32,
@@ -639,7 +654,7 @@ struct Sessions {
     count: Vec<u32>,
     start: Vec<u32>,
     items: Vec<u64>,
-    click_tmp: Vec<(u32, ClickItem)>,
+    click_idx: Vec<u32>,
     click_start: Vec<u32>,
     click_items: Vec<ClickItem>,
     scratch: Scratch,
@@ -652,12 +667,18 @@ struct Scratch {
     starts: Vec<u32>,
     days: Vec<u32>,
     day_end: Vec<u32>,
-    by_campaign: Vec<(u32, u32)>,
+    /// Per campaign: the end of its merged click intervals so far (0 = none)
+    /// and the number of session starts up to that end.
+    covered: Vec<(u32, u32)>,
+    /// Per campaign: the last session (by serial) it assisted.
+    assisted_by: Vec<u32>,
+    serial: u32,
     categories: Vec<(u8, u64)>,
 }
 
 struct Output {
-    rows: Vec<UserRow>,
+    rows: Bucket<UserRow>,
+    slab: Slab,
     counts: Vec<Counts>,
 }
 
@@ -668,6 +689,7 @@ struct Session<'a> {
     items: &'a [u64],
 }
 
+#[cfg(test)]
 fn sorted_sessions(mut events: &[u64]) -> impl Iterator<Item = Session<'_>> {
     std::iter::from_fn(move || {
         let start = (*events.first()? >> 32) as u32;
@@ -697,7 +719,9 @@ struct TimeBin {
 
 #[derive(Default)]
 struct BinnedSessions {
+    /// All empty between calls.
     bins: Vec<TimeBin>,
+    touched: Vec<u32>,
     purchase_links: Vec<u64>,
     items: Vec<u64>,
     sessions: Vec<SessionSpan>,
@@ -714,11 +738,12 @@ impl BinnedSessions {
     /// Events in one GAP-wide bin form one run. Neighboring runs extend a
     /// session exactly when their two closest timestamps are within GAP.
     fn build(&mut self, events: &[u64], max_offset: u32) -> impl Iterator<Item = Session<'_>> {
-        self.bins.clear();
-        self.bins.resize(
-            (max_offset / GAP) as usize + 1,
-            TimeBin { first: u32::MAX, last: 0, events: 0, purchase: 0 },
-        );
+        const EMPTY: TimeBin = TimeBin { first: u32::MAX, last: 0, events: 0, purchase: 0 };
+        let len = (max_offset / GAP) as usize + 1;
+        if self.bins.len() < len {
+            self.bins.resize(len, EMPTY);
+        }
+        self.touched.clear();
         self.purchase_links.clear();
         self.items.clear();
         self.sessions.clear();
@@ -726,7 +751,11 @@ impl BinnedSessions {
         for &event in events {
             let ts = (event >> 32) as u32;
             let pc = event as u32;
-            let bin = &mut self.bins[(ts / GAP) as usize];
+            let at = (ts / GAP) as usize;
+            let bin = &mut self.bins[at];
+            if bin.events == 0 {
+                self.touched.push(at as u32);
+            }
             bin.first = bin.first.min(ts);
             bin.last = bin.last.max(ts);
             bin.events += 1;
@@ -735,9 +764,18 @@ impl BinnedSessions {
                 bin.purchase = self.purchase_links.len() as u32;
             }
         }
+        // Visit the used bins in time order; few used bins are sorted, many
+        // are found by a scan. Each visited bin is emptied again.
+        if self.touched.len() * 8 > len {
+            self.touched.clear();
+            self.touched.extend((0..len as u32).filter(|&i| self.bins[i as usize].events != 0));
+        } else {
+            self.touched.sort_unstable();
+        }
 
         let mut prev = 0;
-        for bin in self.bins.iter().filter(|bin| bin.events != 0) {
+        for &at in &self.touched {
+            let bin = std::mem::replace(&mut self.bins[at as usize], EMPTY);
             let start_item = self.items.len();
             let mut p = bin.purchase;
             while p != 0 {
@@ -822,7 +860,7 @@ fn person<'a>(
         let day = (day_abs - lk.first_day) as usize;
         if row.as_ref().map_or(true, |r| r.day as i64 != day_abs) {
             if let Some(r) = row.take() {
-                flush(r, &mut sc.categories, &mut out.rows);
+                flush(r, &mut sc.categories, &mut out.rows, &mut out.slab);
             }
             row = Some(UserRow { person, day: day_abs as i32, sessions: 0, events: 0, revenue: 0, top: NO_CATEGORY });
         }
@@ -845,14 +883,14 @@ fn person<'a>(
 
         // The latest click at or before the start; at one timestamp the first
         // click has the smallest click_id.
-        while click_at < clicks.len() && clicks[click_at].ts <= start {
-            if clicks[click_at].ts != clicks[credit].ts {
+        while click_at < clicks.len() && click_ts(clicks[click_at]) <= start {
+            if click_ts(clicks[click_at]) != click_ts(clicks[credit]) {
                 credit = click_at;
             }
             click_at += 1;
         }
-        let campaign = if click_at > 0 && start - clicks[credit].ts <= REACH {
-            clicks[credit].campaign as usize
+        let campaign = if click_at > 0 && start - click_ts(clicks[credit]) <= REACH {
+            click_campaign(clicks[credit])
         } else {
             organic
         };
@@ -867,47 +905,91 @@ fn person<'a>(
         }
     }
     if let Some(r) = row.take() {
-        flush(r, &mut sc.categories, &mut out.rows);
+        flush(r, &mut sc.categories, &mut out.rows, &mut out.slab);
     }
     if clicks.is_empty() {
         return;
     }
+    assists(clicks, lk, sc, out);
+}
 
-    // Assists: per campaign, merge [click, click + 7 days] intervals; every
-    // session starting inside one is assisted once, counted per day.
+/// Assists: every campaign with a click in [start - 7 days, start] assists
+/// the session starting at `start` once, counted on the session's day.
+fn assists(clicks: &[ClickItem], lk: &Lookups, sc: &mut Scratch, out: &mut Output) {
     let n = sc.starts.len();
+    let campaigns = lk.channels.len();
+    if n <= FEW_SESSIONS {
+        // Few sessions: look at each session's window of clicks.
+        if sc.assisted_by.len() < campaigns {
+            sc.assisted_by.resize(campaigns, 0);
+        }
+        let (mut hi, mut lo) = (0, 0);
+        for j in 0..n {
+            let start = sc.starts[j];
+            while hi < clicks.len() && click_ts(clicks[hi]) <= start {
+                hi += 1;
+            }
+            while lo < hi && click_ts(clicks[lo]) + REACH < start {
+                lo += 1;
+            }
+            if lo < hi {
+                sc.serial += 1;
+                let day = sc.days[j] as usize;
+                for click in &clicks[lo..hi] {
+                    let slot = &mut sc.assisted_by[click_campaign(*click)];
+                    if *slot != sc.serial {
+                        *slot = sc.serial;
+                        out.counts[click_campaign(*click) * lk.days + day].assisted += 1;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Many sessions: per campaign, merge [click, click + 7 days] intervals;
+    // `clicks` are sorted by time, so each click only adds the part of its
+    // interval beyond the previous one, and every session in it is assisted.
     sc.day_end.clear();
     sc.day_end.resize(n, n as u32);
     for k in (0..n.saturating_sub(1)).rev() {
         sc.day_end[k] = if sc.days[k] == sc.days[k + 1] { sc.day_end[k + 1] } else { k as u32 + 1 };
     }
-    sc.by_campaign.clear();
-    sc.by_campaign.extend(clicks.iter().map(|c| (c.campaign, c.ts)));
-    sc.by_campaign.sort_unstable();
-    let mut k = 0;
-    while k < sc.by_campaign.len() {
-        let (campaign, ts) = sc.by_campaign[k];
-        let (lo, mut hi) = (ts, ts + REACH);
-        k += 1;
-        while k < sc.by_campaign.len() && sc.by_campaign[k].0 == campaign && sc.by_campaign[k].1 <= hi {
-            hi = sc.by_campaign[k].1 + REACH;
-            k += 1;
+    if sc.covered.len() < campaigns {
+        sc.covered.resize(campaigns, (0, 0));
+    }
+    // Both ends move forward with the click time: `from` is the first
+    // session starting at or after the click, `to` the first one after
+    // its 7 days.
+    let (mut from, mut to) = (0, 0);
+    for c in clicks {
+        while from < n && sc.starts[from] < click_ts(*c) {
+            from += 1;
         }
-        let mut a = sc.starts.partition_point(|&s| s < lo);
-        let b = sc.starts.partition_point(|&s| s <= hi);
-        while a < b {
-            let next = (sc.day_end[a] as usize).min(b);
-            out.counts[campaign as usize * lk.days + sc.days[a] as usize].assisted += (next - a) as u64;
+        let hi = click_ts(*c) + REACH;
+        while to < n && sc.starts[to] <= hi {
+            to += 1;
+        }
+        let slot = &mut sc.covered[click_campaign(*c)];
+        // Sessions up to `slot.1` already count for this campaign.
+        let mut a = if slot.0 != 0 && click_ts(*c) <= slot.0 { slot.1 as usize } else { from };
+        *slot = (hi, to as u32);
+        while a < to {
+            let next = (sc.day_end[a] as usize).min(to);
+            out.counts[click_campaign(*c) * lk.days + sc.days[a] as usize].assisted += (next - a) as u64;
             a = next;
         }
     }
+    for c in clicks {
+        sc.covered[click_campaign(*c)] = (0, 0);
+    }
 }
 
-fn flush(mut r: UserRow, categories: &mut Vec<(u8, u64)>, rows: &mut Vec<UserRow>) {
+fn flush(mut r: UserRow, categories: &mut Vec<(u8, u64)>, rows: &mut Bucket<UserRow>, slab: &mut Slab) {
     // Highest sum; categories are indexed in byte order, so ties go to the lowest index.
     r.top = categories.iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0))).map_or(NO_CATEGORY, |c| c.0);
     categories.clear();
-    rows.push(r);
+    rows.push(slab, r);
 }
 
 /// The sessions pass for one person bucket.
@@ -954,18 +1036,19 @@ fn sessions_bucket(events: &[&[Event]], clicks: &[&[Click]], lk: &Lookups, st: &
     }
 
     // Clicks of the people with events, grouped the same way.
-    st.click_tmp.clear();
-    for s in clicks {
-        for c in s.iter() {
-            if let Some(i) = st.local.get(c.person) {
-                st.click_tmp.push((i, ClickItem { cid: c.cid, ts: c.ts, campaign: c.campaign }));
-            }
-        }
-    }
+    st.click_idx.clear();
     st.count.clear();
     st.count.resize(persons, 0);
-    for &(i, _) in &st.click_tmp {
-        st.count[i as usize] += 1;
+    let mut interned = false;
+    for s in clicks {
+        for c in s.iter() {
+            let i = st.local.get(c.person).unwrap_or(u32::MAX);
+            if i != u32::MAX {
+                st.count[i as usize] += 1;
+                interned |= c.cid & INTERNED != 0;
+            }
+            st.click_idx.push(i);
+        }
     }
     st.click_start.clear();
     let mut total = 0u32;
@@ -976,39 +1059,44 @@ fn sessions_bucket(events: &[&[Event]], clicks: &[&[Click]], lk: &Lookups, st: &
     st.click_start.push(total);
     st.count.copy_from_slice(&st.click_start[..persons]);
     st.click_items.clear();
-    st.click_items.resize(st.click_tmp.len(), ClickItem { cid: 0, ts: 0, campaign: 0 });
-    for &(i, c) in &st.click_tmp {
-        st.click_items[st.count[i as usize] as usize] = c;
-        st.count[i as usize] += 1;
+    st.click_items.resize(total as usize, 0);
+    let mut k = 0;
+    for s in clicks {
+        for c in s.iter() {
+            let i = st.click_idx[k];
+            k += 1;
+            if i != u32::MAX {
+                st.click_items[st.count[i as usize] as usize] =
+                    (c.ts as u128) << 96 | (c.cid as u128) << 32 | c.campaign as u128;
+                st.count[i as usize] += 1;
+            }
+        }
     }
 
+    let max = (lk.window_end - 1 - lk.base) as u32;
     for p in 0..persons {
-        let ev = &mut st.items[st.start[p] as usize..st.start[p + 1] as usize];
+        let ev = &st.items[st.start[p] as usize..st.start[p + 1] as usize];
         let cl = &mut st.click_items[st.click_start[p] as usize..st.click_start[p + 1] as usize];
         let mut m = cl.len();
         if m > 1 {
-            if cl.iter().any(|c| c.cid & INTERNED != 0) {
-                cl.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| lk.ids.cmp(a.cid, b.cid)));
+            if interned {
+                cl.sort_unstable_by(|&a, &b| {
+                    click_ts(a).cmp(&click_ts(b)).then_with(|| lk.ids.cmp(click_cid(a), click_cid(b)))
+                });
             } else {
-                cl.sort_unstable_by_key(|c| (c.ts, c.cid));
+                cl.sort_unstable();
             }
             // Copies of a click are identical, so they are now adjacent.
             m = 1;
             for r in 1..cl.len() {
-                if cl[r].cid != cl[m - 1].cid {
+                if click_cid(cl[r]) != click_cid(cl[m - 1]) {
                     cl[m] = cl[r];
                     m += 1;
                 }
             }
         }
-        if ev.len() >= 2048 {
-            let max = (lk.window_end - 1 - lk.base) as u32;
-            let sessions = st.dense_sessions.build(ev, max);
-            person(st.local.persons[p], sessions, &cl[..m], lk, &mut st.scratch, &mut st.out);
-        } else {
-            ev.sort_unstable();
-            person(st.local.persons[p], sorted_sessions(ev), &cl[..m], lk, &mut st.scratch, &mut st.out);
-        }
+        let sessions = st.dense_sessions.build(ev, max);
+        person(st.local.persons[p], sessions, &cl[..m], lk, &mut st.scratch, &mut st.out);
     }
 }
 
@@ -1019,34 +1107,90 @@ fn write_tables(out: &Path, outputs: &[Output], counts: &[Counts], lk: &Lookups,
     std::fs::create_dir_all(&campaign_dir).unwrap();
 
     let total: usize = outputs.iter().map(|o| o.rows.len()).sum();
-    let per = total.div_ceil(threads * 2).max(1);
-    let pieces: Vec<&[UserRow]> =
-        if total == 0 { vec![&[]] } else { outputs.iter().flat_map(|o| o.rows.chunks(per)).collect() };
-    run(threads, pieces.len(), || (), |_, p| {
-        let piece = pieces[p];
-        let mut ids = Vec::with_capacity(piece.len() * 13);
-        for r in piece {
+    // Pieces of whole chunks, about `per` rows each: small enough that every
+    // thread reuses its column buffers.
+    let per = total.div_ceil(threads * 2).clamp(1, 1 << 16);
+    let mut pieces: Vec<(usize, Vec<&[UserRow]>)> = Vec::new();
+    let (mut rows_in, mut parts): (usize, Vec<&[UserRow]>) = (0, Vec::new());
+    for o in outputs {
+        for s in o.rows.slices() {
+            parts.push(s);
+            rows_in += s.len();
+            if rows_in >= per {
+                pieces.push((rows_in, std::mem::take(&mut parts)));
+                rows_in = 0;
+            }
+        }
+    }
+    if rows_in > 0 || pieces.is_empty() {
+        pieces.push((rows_in, parts));
+    }
+    #[derive(Default)]
+    struct Columns {
+        ids: Vec<u8>,
+        day: Vec<i32>,
+        sessions: Vec<u32>,
+        events: Vec<u32>,
+        revenue: Vec<i64>,
+        levels: Vec<u8>,
+        top: Vec<u8>,
+    }
+    run(threads, pieces.len(), Columns::default, |c, p| {
+        let (n, parts) = &pieces[p];
+        let Columns { ids, day, sessions, events, revenue, levels, top } = c;
+        for v in [&mut *ids, &mut *top, &mut *levels] {
+            v.clear();
+        }
+        day.clear();
+        sessions.clear();
+        events.clear();
+        revenue.clear();
+        // Definition levels: a 4-byte length, then one bit-packed run of
+        // one bit per row (set when the row has a category).
+        let groups = n.div_ceil(8);
+        levels.extend_from_slice(&[0; 4]);
+        let mut header = [0u8; 10];
+        let mut v = ((groups as u64) << 1) | 1;
+        let mut h = 0;
+        while v >= 0x80 {
+            header[h] = (v as u8) | 0x80;
+            v >>= 7;
+            h += 1;
+        }
+        header[h] = v as u8;
+        levels.extend_from_slice(&header[..=h]);
+        let bits_at = levels.len();
+        levels.resize(bits_at + groups, 0);
+        let mut i = 0;
+        for r in parts.iter().flat_map(|s| s.iter()) {
             let start = ids.len();
             ids.extend_from_slice(&[0; 4]);
-            lk.ids.bytes(r.person, &mut ids);
+            lk.ids.bytes(r.person, ids);
             let len = (ids.len() - start - 4) as u32;
             ids[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            day.push(r.day);
+            sessions.push(r.sessions);
+            events.push(r.events);
+            revenue.push(r.revenue as i64);
+            if r.top != NO_CATEGORY {
+                let name = &lk.categories[r.top as usize];
+                top.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                top.extend_from_slice(name);
+                levels[bits_at + i / 8] |= 1 << (i % 8);
+            }
+            i += 1;
         }
-        let day: Vec<i32> = piece.iter().map(|r| r.day).collect();
-        let sessions: Vec<u32> = piece.iter().map(|r| r.sessions).collect();
-        let events: Vec<u32> = piece.iter().map(|r| r.events).collect();
-        let revenue: Vec<i64> = piece.iter().map(|r| r.revenue as i64).collect();
-        let top: Vec<Option<&[u8]>> =
-            piece.iter().map(|r| (r.top != NO_CATEGORY).then(|| lk.categories[r.top as usize].as_slice())).collect();
+        let level_bytes = (levels.len() - 4) as u32;
+        levels[..4].copy_from_slice(&level_bytes.to_le_bytes());
         parquet::write(
             &user_dir.join(format!("part-{p:05}.parquet")),
             &[
-                Column { name: "user_id", values: Values::PlainStr { rows: piece.len(), bytes: &ids } },
-                Column { name: "day", values: Values::Date(&day) },
-                Column { name: "sessions", values: Values::U32(&sessions) },
-                Column { name: "events", values: Values::U32(&events) },
-                Column { name: "revenue_cents", values: Values::I64(&revenue) },
-                Column { name: "top_category", values: Values::OptStr(&top) },
+                Column { name: "user_id", values: Values::PlainStr { rows: *n, bytes: ids } },
+                Column { name: "day", values: Values::Date(day) },
+                Column { name: "sessions", values: Values::U32(sessions) },
+                Column { name: "events", values: Values::U32(events) },
+                Column { name: "revenue_cents", values: Values::I64(revenue) },
+                Column { name: "top_category", values: Values::OptStrPage { rows: *n, levels, values: top } },
             ],
         )
         .expect("write user_daily");
@@ -1242,12 +1386,12 @@ fn main() {
             count: Vec::new(),
             start: Vec::new(),
             items: Vec::new(),
-            click_tmp: Vec::new(),
+            click_idx: Vec::new(),
             click_start: Vec::new(),
             click_items: Vec::new(),
             scratch: Scratch::default(),
             dense_sessions: BinnedSessions::default(),
-            out: Output { rows: Vec::new(), counts: vec![Counts::default(); slots] },
+            out: Output { rows: Bucket::new(), slab: Slab::new(), counts: vec![Counts::default(); slots] },
         },
         |st, t| {
             let b = order[t];

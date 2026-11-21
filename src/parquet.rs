@@ -12,6 +12,9 @@ pub enum Values<'a> {
     Date(&'a [i32]),
     Str(&'a [&'a [u8]]),
     OptStr(&'a [Option<&'a [u8]>]),
+    /// A pre-encoded optional string page: `levels` is the 4-byte length and
+    /// the definition levels, `values` the PLAIN strings of the present rows.
+    OptStrPage { rows: usize, levels: &'a [u8], values: &'a [u8] },
 }
 
 pub struct Column<'a> {
@@ -111,6 +114,7 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
         Values::Date(v) => v.len(),
         Values::Str(v) => v.len(),
         Values::OptStr(v) => v.len(),
+        Values::OptStrPage { rows, .. } => *rows,
     };
     let mut file = std::fs::File::create(path)?;
     file.write_all(b"PAR1")?;
@@ -119,11 +123,16 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
     let mut page = Vec::new();
     for column in columns {
         page.clear();
+        let mut tail: &[u8] = &[];
         let body = match &column.values {
             Values::I64(v) => unsafe { plain_numbers(v) },
             Values::U32(v) => unsafe { plain_numbers(v) },
             Values::Date(v) => unsafe { plain_numbers(v) },
             Values::PlainStr { bytes, .. } => *bytes,
+            Values::OptStrPage { levels, values, .. } => {
+                tail = values;
+                *levels
+            }
             Values::Str(v) => {
                 for s in v.iter() {
                     page.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -155,8 +164,8 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
         };
         let mut h = Thrift::new();
         h.i32(1, 0); // DATA_PAGE
-        h.i32(2, body.len() as i32);
-        h.i32(3, body.len() as i32);
+        h.i32(2, (body.len() + tail.len()) as i32);
+        h.i32(3, (body.len() + tail.len()) as i32);
         h.begin_struct(5);
         h.i32(1, rows as i32);
         h.i32(2, PLAIN);
@@ -166,7 +175,8 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
         h.buf.push(0);
         file.write_all(&h.buf)?;
         file.write_all(body)?;
-        let size = (h.buf.len() + body.len()) as i64;
+        file.write_all(tail)?;
+        let size = (h.buf.len() + body.len() + tail.len()) as i64;
         metas.push(ChunkMeta { offset, size, count: rows as i64 });
         offset += size;
     }
@@ -186,10 +196,10 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
     for column in columns {
         f.begin_element();
         f.i32(1, physical(&column.values));
-        f.i32(3, if matches!(column.values, Values::OptStr(_)) { OPTIONAL } else { REQUIRED });
+        f.i32(3, if matches!(column.values, Values::OptStr(_) | Values::OptStrPage { .. }) { OPTIONAL } else { REQUIRED });
         f.binary(4, column.name.as_bytes());
         match column.values {
-            Values::Str(_) | Values::OptStr(_) | Values::PlainStr { .. } => {
+            Values::Str(_) | Values::OptStr(_) | Values::OptStrPage { .. } | Values::PlainStr { .. } => {
                 f.i32(6, CONVERTED_UTF8);
                 f.begin_struct(10);
                 f.begin_struct(1); // StringType
