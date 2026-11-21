@@ -12,6 +12,7 @@ Three parallel passes over cache-sized buckets, then the write. Timestamps are k
 | Values | F1/F2 timestamps are validated and split with one SSSE3 pass and dated from a month table (1900–2199; other years take the scalar path). F3 has a 13-digit SIMD path. | [src/ts.rs](src/ts.rs) |
 | IDs | Short ASCII IDs pack into a `u64` whose integer order is the byte order; other IDs are interned. Nothing compares by hash alone. | [src/key.rs](src/key.rs) |
 | Links | Union-find over IDs numbered in byte order, with the smaller number always the root, so a component's root is its name. Linked IDs go into an open-addressing table behind a bit filter. | [src/main.rs](src/main.rs) |
+| Buckets | Records are appended to per-bucket lists of 32 KB chunks carved from per-thread 32 MB huge-page slabs ([src/chunks.rs](src/chunks.rs)): no regrowth, no copies, and about a third of the page faults of growing vectors. | [src/chunks.rs](src/chunks.rs) |
 | Dedup + route | Per event bucket, a bitmap proves most `event_id`s unique; repeated bits (collisions included) go through an exact map that keeps the smallest `ingest_ts`. Valid winners and clicks are resolved to their person (prefetched lookups) and sent to 512 person buckets. | [src/main.rs](src/main.rs) |
 | Sessions | Per person bucket: a dense local index and counting sort group events and clicks by person; each person's events are sorted by time, split on gaps over 30 minutes, credited (latest click within 7 days, smallest `click_id` on ties) and assisted (merged 7-day click intervals per campaign). | [src/main.rs](src/main.rs) |
 | Write | A minimal Parquet writer: PLAIN, uncompressed, `day` as `DATE`. | [src/parquet.rs](src/parquet.rs) |
@@ -24,8 +25,8 @@ If a dataset is outside this layout's limits (a window too long for `u32` offset
 
 | Dataset | Events | Wall time | Previous version |
 | --- | --- | --- | --- |
-| practice size, seed 21 | 20M | 0.56 s | 1.34 s |
-| final size, seed 61 | 60M | 1.76 s | 4.1 s |
+| practice size, seed 21 | 20M | 0.52 s | 1.34 s |
+| final size, seed 61 | 60M | 1.59 s | 4.1 s |
 
 ## Verification
 

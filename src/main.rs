@@ -14,6 +14,7 @@
 //! window). When a dataset breaks that or another limit of this layout, the
 //! general pipeline in `legacy` runs instead.
 
+mod chunks;
 mod csv;
 mod key;
 mod legacy;
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::{AcqRel, Relaxed}};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use chunks::{Bucket, Slab};
 use key::{hash, Interner, Key, KeyMap, INTERNED};
 use parquet::{Column, Values};
 use ts::DAY;
@@ -407,7 +409,7 @@ impl<T: Copy> Batch<T> {
 }
 
 #[inline(always)]
-fn parse_event(f: &[&[u8]; 7], lk: &Lookups, out: &mut [Vec<Raw>]) {
+fn parse_event(f: &[&[u8]; 7], lk: &Lookups, out: &mut [Bucket<Raw>], slab: &mut Slab) {
     if f[0].is_empty() {
         return;
     }
@@ -436,11 +438,11 @@ fn parse_event(f: &[&[u8]; 7], lk: &Lookups, out: &mut [Vec<Raw>]) {
         raw.uid = lk.ids.key(f[1]);
         raw.ts = (ts - lk.base) as u32;
     }
-    out[bucket(raw.eid)].push(raw);
+    out[bucket(raw.eid)].push(slab, raw);
 }
 
 #[inline(always)]
-fn parse_click(f: &[&[u8]; 4], lk: &Lookups, out: &mut Vec<Click>) {
+fn parse_click(f: &[&[u8]; 4], lk: &Lookups, out: &mut Bucket<Click>, slab: &mut Slab) {
     if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
         return;
     }
@@ -449,7 +451,7 @@ fn parse_click(f: &[&[u8]; 4], lk: &Lookups, out: &mut Vec<Click>) {
         return;
     }
     let Some(&campaign) = lk.campaigns.get(&lk.ids.key(f[2])) else { return };
-    out.push(Click { person: lk.ids.key(f[1]), cid: lk.ids.key(f[0]), ts: (ts - lk.base) as u32, campaign });
+    out.push(slab, Click { person: lk.ids.key(f[1]), cid: lk.ids.key(f[0]), ts: (ts - lk.base) as u32, campaign });
 }
 
 /// Task order: biggest first, so one large bucket does not finish last.
@@ -898,14 +900,16 @@ fn write_tables(out: &Path, outputs: &[Output], counts: &[Counts], lk: &Lookups,
 }
 
 struct Parsed {
-    raw: Vec<Vec<Raw>>,
-    clicks: Vec<Click>,
+    raw: Vec<Bucket<Raw>>,
+    clicks: Bucket<Click>,
+    slab: Slab,
 }
 
 struct Routed {
-    events: Vec<Vec<Event>>,
-    clicks: Vec<Vec<Click>>,
+    events: Vec<Bucket<Event>>,
+    clicks: Vec<Bucket<Click>>,
     dedup: Dedup,
+    slab: Slab,
 }
 
 fn main() {
@@ -937,15 +941,13 @@ fn main() {
     let event_chunks = chunks_of(&event_files);
     let click_chunks = chunks_of(&click_files);
     let (nl, ne) = (link_chunks.len(), event_chunks.len());
-    let event_bytes: usize = event_files.iter().map(|m| m.bytes().len()).sum();
-    let per_bucket = event_bytes / 64 / BUCKETS / threads + 16;
     let link_pairs = Mutex::new(Vec::new());
     let links_left = AtomicUsize::new(nl);
     let names = Mutex::new(None);
     let parsed = run(
         threads,
         nl + ne + click_chunks.len(),
-        || Parsed { raw: (0..BUCKETS).map(|_| Vec::with_capacity(per_bucket)).collect(), clicks: Vec::new() },
+        || Parsed { raw: (0..BUCKETS).map(|_| Bucket::new()).collect(), clicks: Bucket::new(), slab: Slab::new() },
         |st, t| {
             if t < nl {
                 let (data, s, e) = link_chunks[t];
@@ -963,10 +965,10 @@ fn main() {
                 }
             } else if t < nl + ne {
                 let (data, s, e) = event_chunks[t - nl];
-                csv::rows::<7>(data, s, e, |f| parse_event(f, &lk, &mut st.raw));
+                csv::rows::<7>(data, s, e, |f| parse_event(f, &lk, &mut st.raw, &mut st.slab));
             } else {
                 let (data, s, e) = click_chunks[t - nl - ne];
-                csv::rows::<4>(data, s, e, |f| parse_click(f, &lk, &mut st.clicks));
+                csv::rows::<4>(data, s, e, |f| parse_click(f, &lk, &mut st.clicks, &mut st.slab));
             }
         },
     );
@@ -974,7 +976,7 @@ fn main() {
     lap("parse");
 
     // 2. Route: dedup event buckets, and clicks, to person buckets.
-    let mut by_bucket: Vec<Vec<Vec<Raw>>> = (0..BUCKETS).map(|_| Vec::with_capacity(threads)).collect();
+    let mut by_bucket: Vec<Vec<Bucket<Raw>>> = (0..BUCKETS).map(|_| Vec::with_capacity(threads)).collect();
     let mut click_lists = Vec::with_capacity(parsed.len());
     for p in parsed {
         for (b, v) in p.raw.into_iter().enumerate() {
@@ -982,26 +984,26 @@ fn main() {
         }
         click_lists.push(p.clicks);
     }
-    let sizes: Vec<usize> = by_bucket.iter().map(|b| b.iter().map(Vec::len).sum()).collect();
+    let sizes: Vec<usize> = by_bucket.iter().map(|b| b.iter().map(Bucket::len).sum()).collect();
     let order = by_size(&sizes);
-    let by_bucket: Vec<Mutex<Vec<Vec<Raw>>>> = by_bucket.into_iter().map(Mutex::new).collect();
-    const CLICK_SLICE: usize = 1 << 16;
-    let click_slices: Vec<&[Click]> = click_lists.iter().flat_map(|l| l.chunks(CLICK_SLICE)).collect();
+    let by_bucket: Vec<Mutex<Vec<Bucket<Raw>>>> = by_bucket.into_iter().map(Mutex::new).collect();
+    let click_slices: Vec<&[Click]> = click_lists.iter().flat_map(|l| l.slices()).collect();
     let routed = run(
         threads,
         BUCKETS + click_slices.len(),
         || Routed {
-            events: (0..BUCKETS).map(|_| Vec::new()).collect(),
-            clicks: (0..BUCKETS).map(|_| Vec::new()).collect(),
+            events: (0..BUCKETS).map(|_| Bucket::new()).collect(),
+            clicks: (0..BUCKETS).map(|_| Bucket::new()).collect(),
             dedup: Dedup::default(),
+            slab: Slab::new(),
         },
-        |Routed { events, clicks, dedup }, t| {
+        |Routed { events, clicks, dedup, slab }, t| {
             if t < BUCKETS {
                 let b = order[t];
                 let copies = std::mem::take(&mut *by_bucket[b].lock().unwrap());
                 let mut batch = Batch::new((0u32, 0u32));
-                let mut sink = |person: Key, (ts, pc): (u32, u32)| events[bucket(person)].push(Event { person, ts, pc });
-                dedup.winners(sizes[b], copies.iter().flatten(), |e| {
+                let mut sink = |person: Key, (ts, pc): (u32, u32)| events[bucket(person)].push(slab, Event { person, ts, pc });
+                dedup.winners(sizes[b], copies.iter().flat_map(|c| c.slices()).flatten(), |e| {
                     if e.ts != INVALID {
                         batch.push(&names, e.uid, (e.ts, e.pc), &mut sink);
                     }
@@ -1010,7 +1012,7 @@ fn main() {
             } else {
                 let mut batch = Batch::new((0u64, 0u32, 0u32));
                 let mut sink = |person: Key, (cid, ts, campaign): (Key, u32, u32)| {
-                    clicks[bucket(person)].push(Click { person, cid, ts, campaign })
+                    clicks[bucket(person)].push(slab, Click { person, cid, ts, campaign })
                 };
                 for c in click_slices[t - BUCKETS] {
                     batch.push(&names, c.person, (c.cid, c.ts, c.campaign), &mut sink);
@@ -1045,8 +1047,8 @@ fn main() {
         },
         |st, t| {
             let b = order[t];
-            let events: Vec<&[Event]> = routed.iter().map(|r| r.events[b].as_slice()).collect();
-            let clicks: Vec<&[Click]> = routed.iter().map(|r| r.clicks[b].as_slice()).collect();
+            let events: Vec<&[Event]> = routed.iter().flat_map(|r| r.events[b].slices()).collect();
+            let clicks: Vec<&[Click]> = routed.iter().flat_map(|r| r.clicks[b].slices()).collect();
             sessions_bucket(&events, &clicks, &lk, st);
         },
     );
