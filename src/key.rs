@@ -90,9 +90,8 @@ impl Interner {
 /// A fast, well-mixed 64-bit hash of a key, for partitioning and hash maps.
 #[inline]
 pub fn hash(k: Key) -> u64 {
-    let x = (k ^ (k >> 32)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-    let x = (x ^ (x >> 32)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-    x ^ (x >> 32)
+    let product = (k as u128).wrapping_mul(0xa076_1d64_78bd_642f);
+    product as u64 ^ (product >> 64) as u64
 }
 
 #[derive(Default)]

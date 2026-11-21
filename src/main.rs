@@ -463,8 +463,7 @@ fn by_size(sizes: &[usize]) -> Vec<usize> {
 
 #[derive(Default)]
 struct Dedup {
-    seen: Vec<u64>,
-    repeated: Vec<u64>,
+    marks: Vec<u64>,
     candidates: KeyMap<Raw>,
 }
 
@@ -473,24 +472,22 @@ impl Dedup {
     fn winners<'a>(&mut self, len: usize, copies: impl Iterator<Item = &'a Raw> + Clone, mut keep: impl FnMut(&Raw)) {
         // Equal IDs always select the same bit, so a bit set once proves its
         // ID unique. Repeated bits, collisions included, go to an exact map.
-        let words = len.div_ceil(4).clamp(1, 1 << 15).next_power_of_two();
-        self.seen.clear();
-        self.seen.resize(words, 0);
-        self.repeated.clear();
-        self.repeated.resize(words, 0);
+        let words = len.div_ceil(2).clamp(1, 1 << 16).next_power_of_two();
+        self.marks.clear();
+        self.marks.resize(words, 0);
         self.candidates.clear();
         let position = |id| {
             let h = hash(id) as usize;
-            ((h >> 6) & (words - 1), 1u64 << (h & 63))
+            ((h >> 5) & (words - 1), 1u64 << ((h & 31) * 2))
         };
         for e in copies.clone() {
             let (word, bit) = position(e.eid);
-            self.repeated[word] |= self.seen[word] & bit;
-            self.seen[word] |= bit;
+            let marks = &mut self.marks[word];
+            *marks |= bit | ((*marks & bit) << 1);
         }
         for e in copies {
             let (word, bit) = position(e.eid);
-            if self.repeated[word] & bit == 0 {
+            if self.marks[word] & (bit << 1) == 0 {
                 keep(e);
             } else {
                 let best = self.candidates.entry(e.eid).or_insert(*e);
@@ -588,6 +585,7 @@ struct Sessions {
     click_start: Vec<u32>,
     click_items: Vec<ClickItem>,
     scratch: Scratch,
+    dense_sessions: BinnedSessions,
     out: Output,
 }
 
@@ -605,29 +603,163 @@ struct Output {
     counts: Vec<Counts>,
 }
 
-/// One person's sessions, credit and assists. `events` hold ts << 32 | pc,
-/// sorted; `clicks` are sorted by (ts, click_id) without copies.
-fn person(person: Key, events: &[u64], clicks: &[ClickItem], lk: &Lookups, sc: &mut Scratch, out: &mut Output) {
+struct Session<'a> {
+    start: u32,
+    events: u32,
+    /// The low 32 bits carry the purchase amount and category.
+    items: &'a [u64],
+}
+
+fn sorted_sessions(mut events: &[u64]) -> impl Iterator<Item = Session<'_>> {
+    std::iter::from_fn(move || {
+        let start = (*events.first()? >> 32) as u32;
+        let mut end = 1;
+        let mut prev = start;
+        while end < events.len() {
+            let t = (events[end] >> 32) as u32;
+            if t - prev > GAP {
+                break;
+            }
+            prev = t;
+            end += 1;
+        }
+        let (items, rest) = events.split_at(end);
+        events = rest;
+        Some(Session { start, events: end as u32, items })
+    })
+}
+
+#[derive(Clone, Copy)]
+struct TimeBin {
+    first: u32,
+    last: u32,
+    events: u32,
+    purchase: u32,
+}
+
+#[derive(Default)]
+struct BinnedSessions {
+    bins: Vec<TimeBin>,
+    purchase_links: Vec<u64>,
+    items: Vec<u64>,
+    sessions: Vec<SessionSpan>,
+}
+
+struct SessionSpan {
+    start: u32,
+    events: u32,
+    purchase_start: usize,
+    purchase_end: usize,
+}
+
+impl BinnedSessions {
+    /// Events in one GAP-wide bin form one run. Neighboring runs extend a
+    /// session exactly when their two closest timestamps are within GAP.
+    fn build(&mut self, events: &[u64], max_offset: u32) -> impl Iterator<Item = Session<'_>> {
+        self.bins.clear();
+        self.bins.resize(
+            (max_offset / GAP) as usize + 1,
+            TimeBin { first: u32::MAX, last: 0, events: 0, purchase: 0 },
+        );
+        self.purchase_links.clear();
+        self.items.clear();
+        self.sessions.clear();
+
+        for &event in events {
+            let ts = (event >> 32) as u32;
+            let pc = event as u32;
+            let bin = &mut self.bins[(ts / GAP) as usize];
+            bin.first = bin.first.min(ts);
+            bin.last = bin.last.max(ts);
+            bin.events += 1;
+            if pc != 0 {
+                self.purchase_links.push((bin.purchase as u64) << 32 | pc as u64);
+                bin.purchase = self.purchase_links.len() as u32;
+            }
+        }
+
+        let mut prev = 0;
+        for bin in self.bins.iter().filter(|bin| bin.events != 0) {
+            let start_item = self.items.len();
+            let mut p = bin.purchase;
+            while p != 0 {
+                let link = self.purchase_links[p as usize - 1];
+                self.items.push(link as u32 as u64);
+                p = (link >> 32) as u32;
+            }
+            let end_item = self.items.len();
+            if self.sessions.is_empty() || bin.first - prev > GAP {
+                self.sessions.push(SessionSpan {
+                    start: bin.first,
+                    events: bin.events,
+                    purchase_start: start_item,
+                    purchase_end: end_item,
+                });
+            } else {
+                let last = self.sessions.last_mut().unwrap();
+                last.events += bin.events;
+                last.purchase_end = end_item;
+            }
+            prev = bin.last;
+        }
+
+        self.sessions.iter().map(|span| Session {
+            start: span.start,
+            events: span.events,
+            items: &self.items[span.purchase_start..span.purchase_end],
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn time_bins_match_sorted_sessions_at_gap_boundary() {
+    let event = |time: u32, purchase: u32| (time as u64) << 32 | purchase as u64;
+    let events = [
+        event(3 * GAP, 37),
+        event(GAP, 19),
+        event(0, 0),
+        event(2 * GAP + 1, 0),
+        event(4 * GAP + 1, 59),
+        event(GAP, 23),
+    ];
+    let summary = |session: Session<'_>| {
+        let mut purchases: Vec<_> = session.items.iter()
+            .map(|&event| event as u32)
+            .filter(|&purchase| purchase != 0)
+            .collect();
+        purchases.sort_unstable();
+        (session.start, session.events, purchases)
+    };
+    let mut sorted = events;
+    sorted.sort_unstable();
+    let reference: Vec<_> = sorted_sessions(&sorted).map(summary).collect();
+    let actual: Vec<_> = BinnedSessions::default()
+        .build(&events, 4 * GAP + 1)
+        .map(summary)
+        .collect();
+    assert_eq!(actual, reference);
+    assert_eq!(actual.len(), 3);
+}
+
+/// Aggregate a person's sessions and credit their sorted clicks.
+fn person<'a>(
+    person: Key,
+    sessions: impl Iterator<Item = Session<'a>>,
+    clicks: &[ClickItem],
+    lk: &Lookups,
+    sc: &mut Scratch,
+    out: &mut Output,
+) {
     let organic = lk.channels.len();
     sc.starts.clear();
     sc.days.clear();
     sc.categories.clear();
     let mut row: Option<UserRow> = None;
-    let mut i = 0;
     let mut click_at = 0;
     let mut credit = 0;
-    while i < events.len() {
-        let start = (events[i] >> 32) as u32;
-        let mut j = i + 1;
-        let mut prev = start;
-        while j < events.len() {
-            let t = (events[j] >> 32) as u32;
-            if t - prev > GAP {
-                break;
-            }
-            prev = t;
-            j += 1;
-        }
+    for session in sessions {
+        let start = session.start;
         let day_abs = (lk.base + start as i64).div_euclid(DAY);
         let day = (day_abs - lk.first_day) as usize;
         if row.as_ref().map_or(true, |r| r.day as i64 != day_abs) {
@@ -638,9 +770,9 @@ fn person(person: Key, events: &[u64], clicks: &[ClickItem], lk: &Lookups, sc: &
         }
         let r = row.as_mut().unwrap();
         r.sessions += 1;
-        r.events += (j - i) as u32;
+        r.events += session.events;
         let mut revenue = 0u64;
-        for &e in &events[i..j] {
+        for &e in session.items {
             let price = (e as u32 & PRICE_MASK) as u64;
             if price > 0 {
                 revenue += price;
@@ -675,7 +807,6 @@ fn person(person: Key, events: &[u64], clicks: &[ClickItem], lk: &Lookups, sc: &
             sc.starts.push(start);
             sc.days.push(day as u32);
         }
-        i = j;
     }
     if let Some(r) = row.take() {
         flush(r, &mut sc.categories, &mut out.rows);
@@ -795,7 +926,6 @@ fn sessions_bucket(events: &[&[Event]], clicks: &[&[Click]], lk: &Lookups, st: &
 
     for p in 0..persons {
         let ev = &mut st.items[st.start[p] as usize..st.start[p + 1] as usize];
-        ev.sort_unstable();
         let cl = &mut st.click_items[st.click_start[p] as usize..st.click_start[p + 1] as usize];
         let mut m = cl.len();
         if m > 1 {
@@ -813,7 +943,14 @@ fn sessions_bucket(events: &[&[Event]], clicks: &[&[Click]], lk: &Lookups, st: &
                 }
             }
         }
-        person(st.local.persons[p], ev, &cl[..m], lk, &mut st.scratch, &mut st.out);
+        if ev.len() >= 2048 {
+            let max = (lk.window_end - 1 - lk.base) as u32;
+            let sessions = st.dense_sessions.build(ev, max);
+            person(st.local.persons[p], sessions, &cl[..m], lk, &mut st.scratch, &mut st.out);
+        } else {
+            ev.sort_unstable();
+            person(st.local.persons[p], sorted_sessions(ev), &cl[..m], lk, &mut st.scratch, &mut st.out);
+        }
     }
 }
 
@@ -829,31 +966,27 @@ fn write_tables(out: &Path, outputs: &[Output], counts: &[Counts], lk: &Lookups,
         if total == 0 { vec![&[]] } else { outputs.iter().flat_map(|o| o.rows.chunks(per)).collect() };
     run(threads, pieces.len(), || (), |_, p| {
         let piece = pieces[p];
-        let mut arena = Vec::with_capacity(piece.len() * 12);
-        let mut ends = Vec::with_capacity(piece.len());
+        let mut ids = Vec::with_capacity(piece.len() * 13);
         for r in piece {
-            lk.ids.bytes(r.person, &mut arena);
-            ends.push(arena.len());
-        }
-        let mut ids: Vec<&[u8]> = Vec::with_capacity(piece.len());
-        let mut start = 0;
-        for &e in &ends {
-            ids.push(&arena[start..e]);
-            start = e;
+            let start = ids.len();
+            ids.extend_from_slice(&[0; 4]);
+            lk.ids.bytes(r.person, &mut ids);
+            let len = (ids.len() - start - 4) as u32;
+            ids[start..start + 4].copy_from_slice(&len.to_le_bytes());
         }
         let day: Vec<i32> = piece.iter().map(|r| r.day).collect();
-        let sessions: Vec<i64> = piece.iter().map(|r| r.sessions as i64).collect();
-        let events: Vec<i64> = piece.iter().map(|r| r.events as i64).collect();
+        let sessions: Vec<u32> = piece.iter().map(|r| r.sessions).collect();
+        let events: Vec<u32> = piece.iter().map(|r| r.events).collect();
         let revenue: Vec<i64> = piece.iter().map(|r| r.revenue as i64).collect();
         let top: Vec<Option<&[u8]>> =
             piece.iter().map(|r| (r.top != NO_CATEGORY).then(|| lk.categories[r.top as usize].as_slice())).collect();
         parquet::write(
             &user_dir.join(format!("part-{p:05}.parquet")),
             &[
-                Column { name: "user_id", values: Values::Str(&ids) },
+                Column { name: "user_id", values: Values::PlainStr { rows: piece.len(), bytes: &ids } },
                 Column { name: "day", values: Values::Date(&day) },
-                Column { name: "sessions", values: Values::I64(&sessions) },
-                Column { name: "events", values: Values::I64(&events) },
+                Column { name: "sessions", values: Values::U32(&sessions) },
+                Column { name: "events", values: Values::U32(&events) },
                 Column { name: "revenue_cents", values: Values::I64(&revenue) },
                 Column { name: "top_category", values: Values::OptStr(&top) },
             ],
@@ -973,6 +1106,10 @@ fn main() {
         },
     );
     let names = names.into_inner().unwrap().unwrap_or_else(Names::empty);
+    // Parsed data owns its IDs and timestamps. The input pages can be
+    // released before routing allocates the next set of buckets.
+    drop((link_chunks, event_chunks, click_chunks));
+    drop((link_files, event_files, click_files));
     lap("parse");
 
     // 2. Route: dedup event buckets, and clicks, to person buckets.
@@ -1043,6 +1180,7 @@ fn main() {
             click_start: Vec::new(),
             click_items: Vec::new(),
             scratch: Scratch::default(),
+            dense_sessions: BinnedSessions::default(),
             out: Output { rows: Vec::new(), counts: vec![Counts::default(); slots] },
         },
         |st, t| {

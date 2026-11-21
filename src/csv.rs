@@ -285,30 +285,27 @@ unsafe fn fields_from_masks<'a, const N: usize>(
     paired_quotes == quotes
 }
 
-/// Comma, newline and quote masks of the 128 bytes at `p`.
+/// Classify two vectors for compact records and a third for wider records.
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
-unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
+unsafe fn row_masks<const N: usize>(p: *const u8) -> (u128, u128, u128) {
     use std::arch::x86_64::*;
-    let v = [
-        _mm256_loadu_si256(p.cast()),
-        _mm256_loadu_si256(p.add(32).cast()),
-        _mm256_loadu_si256(p.add(64).cast()),
-        _mm256_loadu_si256(p.add(96).cast()),
-    ];
-    let m = |c: u8| {
-        let c = _mm256_set1_epi8(c as i8);
-        let w = |x: __m256i| _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, c)) as u32 as u128;
-        w(v[0]) | (w(v[1]) << 32) | (w(v[2]) << 64) | (w(v[3]) << 96)
+    let a = _mm256_loadu_si256(p.cast());
+    let b = _mm256_loadu_si256(p.add(32).cast());
+    let c = if N > 4 { _mm256_loadu_si256(p.add(64).cast()) } else { _mm256_setzero_si256() };
+    let mask = |byte| {
+        let byte = _mm256_set1_epi8(byte);
+        let bits = |x| _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, byte)) as u32 as u128;
+        bits(a) | (bits(b) << 32) | (if N > 4 { bits(c) } else { 0 } << 64)
     };
-    (m(b','), m(b'\n'), m(b'"'))
+    (mask(b',' as i8), mask(b'\n' as i8), mask(b'"' as i8))
 }
 
 #[cfg(not(target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
+unsafe fn row_masks<const N: usize>(p: *const u8) -> (u128, u128, u128) {
     let (mut c, mut n, mut q) = (0u128, 0u128, 0u128);
-    for i in 0..128 {
+    for i in 0..if N > 4 { 96 } else { 64 } {
         let b = *p.add(i);
         c |= ((b == b',') as u128) << i;
         n |= ((b == b'\n') as u128) << i;
@@ -319,19 +316,20 @@ unsafe fn masks128(p: *const u8) -> (u128, u128, u128) {
 
 /// Visits the well-formed rows whose first byte is in `data[start..end]`,
 /// header skipped, as N fields; an empty field is an empty slice (null).
-/// Each row is classified from the 128 bytes at its own start. A longer row,
-/// or one starting within 128 bytes of the end of `data`, goes through the
+/// Each row is classified from 64 or 96 bytes at its start. A longer row,
+/// or one starting too close to the end of `data`, goes through the
 /// scalar `fields`, which defines the dialect.
 #[inline(always)]
 pub fn rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
     let Some(nl) = memchr(b'\n', data, start.saturating_sub(1)) else { return };
     let mut at = nl + 1;
     let mut out: [&'a [u8]; N] = [&[]; N];
-    let fast_end = data.len().saturating_sub(128);
+    let width = if N > 4 { 96 } else { 64 };
+    let fast_end = data.len().saturating_sub(width);
     while at < end {
         if at <= fast_end {
-            // Safety: at + 128 <= data.len().
-            let (commas, newlines, quotes) = unsafe { masks128(data.as_ptr().add(at)) };
+            // Safety: at is positive and at + width <= data.len().
+            let (commas, newlines, quotes) = unsafe { row_masks::<N>(data.as_ptr().add(at)) };
             if newlines != 0 {
                 let len = newlines.trailing_zeros() as usize;
                 let below = (1u128 << len) - 1;
