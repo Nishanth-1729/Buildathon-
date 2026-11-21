@@ -8,7 +8,9 @@ use std::path::Path;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
+const MADV_DONTNEED: i32 = 4;
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 
@@ -45,6 +47,19 @@ impl Drop for Mapping {
         if self.len != 0 {
             unsafe { munmap(self.ptr, self.len); }
         }
+    }
+}
+
+/// Drops the page-table entries of the whole pages inside `data[start..end]`
+/// once the chunk is parsed. The unmapping at the end then has almost nothing
+/// to tear down, and this part runs on all threads at once. `data` must be a
+/// whole mapping; a page read again later is simply faulted in again.
+pub fn release(data: &[u8], start: usize, end: usize) {
+    let (start, end) = ((start + 4095) & !4095, end & !4095);
+    if end > start {
+        // Safety: a read-only private file mapping, so dropping its pages
+        // only costs a later fault; the range lies inside the mapping.
+        unsafe { madvise(data.as_ptr().add(start) as *mut u8, end - start, MADV_DONTNEED) };
     }
 }
 

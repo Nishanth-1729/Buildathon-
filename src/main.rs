@@ -178,20 +178,45 @@ fn lookups(data: &Path) -> Option<Lookups> {
         return None;
     }
 
-    let product_rows = lookup_rows(&data.join("products.csv"));
-    let mut categories: Vec<Vec<u8>> = product_rows.iter().map(|(_, c)| c.clone()).collect();
-    categories.push(b"unknown".to_vec());
-    categories.sort_unstable();
-    categories.dedup();
-    if categories.len() > NO_CATEGORY as usize {
-        return None;
+    let mapping = csv::Mapping::open(&data.join("products.csv"));
+    let mut product_rows: Vec<(&[u8], &[u8])> = Vec::new();
+    let product_data = mapping.bytes();
+    csv::rows::<2>(product_data, 0, product_data.len(), |f| {
+        if !f[0].is_empty() {
+            product_rows.push((f[0], f[1]));
+        }
+    });
+    // Distinct categories, numbered in first-seen order (unknown is 0), then
+    // renumbered in byte order so a lower index is a byte-wise smaller name.
+    let mut seen: std::collections::HashMap<&[u8], u8, std::hash::BuildHasherDefault<key::KeyHasher>> =
+        Default::default();
+    let mut names: Vec<&[u8]> = vec![b"unknown"];
+    seen.insert(b"unknown", 0);
+    let mut first_seen = Vec::with_capacity(product_rows.len());
+    for &(_, c) in &product_rows {
+        let next = names.len();
+        let id = *seen.entry(c).or_insert(next as u8);
+        if id as usize == next {
+            names.push(c);
+            if names.len() > NO_CATEGORY as usize {
+                return None;
+            }
+        }
+        first_seen.push(id);
     }
-    let index = |c: &[u8]| categories.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u8;
+    let mut order: Vec<u8> = (0..names.len() as u8).collect();
+    order.sort_unstable_by(|&a, &b| names[a as usize].cmp(names[b as usize]));
+    let mut renumber = vec![0u8; names.len()];
+    for (rank, &old) in order.iter().enumerate() {
+        renumber[old as usize] = rank as u8;
+    }
+    let categories: Vec<Vec<u8>> = order.iter().map(|&o| names[o as usize].to_vec()).collect();
     let mut products = KeyMap::default();
-    for (p, c) in &product_rows {
-        products.entry(ids.key(p)).or_insert(index(c));
+    products.reserve(product_rows.len());
+    for (&(p, _), &c) in product_rows.iter().zip(&first_seen) {
+        products.entry(ids.key(p)).or_insert(renumber[c as usize]);
     }
-    let unknown = index(b"unknown");
+    let unknown = renumber[0];
 
     let mut campaigns = KeyMap::default();
     let (mut campaign_names, mut channels) = (Vec::new(), Vec::new());
@@ -264,27 +289,44 @@ impl Names {
         ((h >> 38) as usize & self.filter_mask, 1 << (h >> 32 & 63))
     }
 
+    /// Where to look for k, branch-free: the first slot with HIT set if the
+    /// filter does not rule k out, else slot 0 (always cached) without HIT.
     #[inline(always)]
-    fn prefetch(&self, k: Key) {
-        #[cfg(target_arch = "x86_64")]
-        // Both indexes are masked to their tables.
-        unsafe {
-            use std::arch::x86_64::*;
-            let (word, bit) = self.filter_bit(k);
-            if *self.filter.get_unchecked(word) & bit != 0 {
-                _mm_prefetch(self.slots.as_ptr().add(self.slot(k)).cast::<i8>(), _MM_HINT_T0);
-            }
-        }
+    fn locate(&self, k: Key) -> u32 {
+        let (word, bit) = self.filter_bit(k);
+        let hit = self.filter[word] & bit != 0;
+        (self.slot(k) as u32 | HIT) & (hit as u32).wrapping_neg()
     }
 
     #[inline(always)]
-    fn get(&self, k: Key) -> Key {
-        let (word, bit) = self.filter_bit(k);
-        if self.filter[word] & bit == 0 {
-            return k;
+    fn prefetch(&self, at: u32) {
+        #[cfg(target_arch = "x86_64")]
+        // `at` came from `locate`: its slot index is below the table size.
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.slots.as_ptr().add((at & !HIT) as usize).cast::<i8>(), _MM_HINT_T0);
         }
-        let mut i = self.slot(k);
+    }
+
+    /// The name of k, given `locate(k)`. The first slot is checked without
+    /// branching on the result; only a collision on a possible hit probes on.
+    #[inline(always)]
+    fn resolve(&self, k: Key, at: u32) -> Key {
+        let i = (at & !HIT) as usize;
+        let [sk, sv] = self.slots[i];
+        let found = sk == k;
+        let name = if found { sv } else { k };
+        if (at & HIT != 0) & !found & (sk != 0) {
+            return self.probe_on(k, i);
+        }
+        name
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn probe_on(&self, k: Key, mut i: usize) -> Key {
         loop {
+            i = (i + 1) & self.mask;
             let [sk, sv] = self.slots[i];
             if sk == k {
                 return sv;
@@ -292,7 +334,6 @@ impl Names {
             if sk == 0 {
                 return k;
             }
-            i = (i + 1) & self.mask;
         }
     }
 
@@ -318,6 +359,9 @@ impl Names {
             sides.sort_unstable_by_key(|s| s.0);
         }
         let mut side_id = vec![0u32; sides.len()];
+        for id in side_id.iter_mut().step_by(4096 / 4) {
+            *id = 0;
+        }
         let mut keys: Vec<Key> = Vec::with_capacity(sides.len());
         for &(k, i) in &sides {
             if keys.last() != Some(&k) {
@@ -352,6 +396,11 @@ impl Names {
         let cap = (linked * 2).next_power_of_two().max(16);
         let words = (linked * 16 / 64).next_power_of_two().max(1);
         let mut names = Names { mask: cap - 1, slots: vec![[0, 0]; cap], filter: vec![0; words], filter_mask: words - 1 };
+        // First touches in random order are slow page faults; fault the
+        // table in sequentially (a write per 4 KB page) before filling it.
+        for slot in names.slots.iter_mut().step_by(4096 / 16) {
+            slot[1] = 0;
+        }
         for (i, &r) in parent.iter().enumerate() {
             if r as usize != i {
                 let k = keys[i];
@@ -371,9 +420,11 @@ impl Names {
 /// Resolves IDs to person names through a sliding window: each slot is
 /// prefetched `WINDOW` lookups before it is read.
 const WINDOW: usize = 32;
+const HIT: u32 = 1 << 31;
 
 struct Batch<T: Copy> {
     keys: [Key; WINDOW],
+    at: [u32; WINDOW],
     items: [T; WINDOW],
     pushed: usize,
     done: usize,
@@ -381,19 +432,21 @@ struct Batch<T: Copy> {
 
 impl<T: Copy> Batch<T> {
     fn new(fill: T) -> Self {
-        Batch { keys: [0; WINDOW], items: [fill; WINDOW], pushed: 0, done: 0 }
+        Batch { keys: [0; WINDOW], at: [0; WINDOW], items: [fill; WINDOW], pushed: 0, done: 0 }
     }
 
     #[inline(always)]
     fn push(&mut self, names: &Names, k: Key, item: T, sink: &mut impl FnMut(Key, T)) {
         if self.pushed - self.done == WINDOW {
             let i = self.done % WINDOW;
-            sink(names.get(self.keys[i]), self.items[i]);
+            sink(names.resolve(self.keys[i], self.at[i]), self.items[i]);
             self.done += 1;
         }
-        names.prefetch(k);
+        let at = names.locate(k);
+        names.prefetch(at);
         let i = self.pushed % WINDOW;
         self.keys[i] = k;
+        self.at[i] = at;
         self.items[i] = item;
         self.pushed += 1;
     }
@@ -402,7 +455,7 @@ impl<T: Copy> Batch<T> {
     fn flush(&mut self, names: &Names, sink: &mut impl FnMut(Key, T)) {
         while self.done < self.pushed {
             let i = self.done % WINDOW;
-            sink(names.get(self.keys[i]), self.items[i]);
+            sink(names.resolve(self.keys[i], self.at[i]), self.items[i]);
             self.done += 1;
         }
     }
@@ -469,30 +522,35 @@ struct Dedup {
 
 impl Dedup {
     /// Calls `keep` with the earliest copy of every event_id among `copies`.
-    fn winners<'a>(&mut self, len: usize, copies: impl Iterator<Item = &'a Raw> + Clone, mut keep: impl FnMut(&Raw)) {
+    fn winners(&mut self, len: usize, copies: &[&[Raw]], mut keep: impl FnMut(&Raw)) {
         // Equal IDs always select the same bit, so a bit set once proves its
         // ID unique. Repeated bits, collisions included, go to an exact map.
         let words = len.div_ceil(2).clamp(1, 1 << 16).next_power_of_two();
         self.marks.clear();
         self.marks.resize(words, 0);
         self.candidates.clear();
+        let marks = &mut self.marks[..];
         let position = |id| {
             let h = hash(id) as usize;
             ((h >> 5) & (words - 1), 1u64 << ((h & 31) * 2))
         };
-        for e in copies.clone() {
-            let (word, bit) = position(e.eid);
-            let marks = &mut self.marks[word];
-            *marks |= bit | ((*marks & bit) << 1);
+        for slice in copies {
+            for e in *slice {
+                let (word, bit) = position(e.eid);
+                let m = &mut marks[word];
+                *m |= bit | ((*m & bit) << 1);
+            }
         }
-        for e in copies {
-            let (word, bit) = position(e.eid);
-            if self.marks[word] & (bit << 1) == 0 {
-                keep(e);
-            } else {
-                let best = self.candidates.entry(e.eid).or_insert(*e);
-                if e.ingest < best.ingest {
-                    *best = *e;
+        for slice in copies {
+            for e in *slice {
+                let (word, bit) = position(e.eid);
+                if marks[word] & (bit << 1) == 0 {
+                    keep(e);
+                } else {
+                    let best = self.candidates.entry(e.eid).or_insert(*e);
+                    if e.ingest < best.ingest {
+                        *best = *e;
+                    }
                 }
             }
         }
@@ -1090,6 +1148,7 @@ fn main() {
                         pairs.push((lk.ids.key(f[0]), lk.ids.key(f[1])));
                     }
                 });
+                csv::release(data, s, e);
                 link_pairs.lock().unwrap().push(pairs);
                 if links_left.fetch_sub(1, AcqRel) == 1 {
                     let all = std::mem::take(&mut *link_pairs.lock().unwrap());
@@ -1099,9 +1158,11 @@ fn main() {
             } else if t < nl + ne {
                 let (data, s, e) = event_chunks[t - nl];
                 csv::rows::<7>(data, s, e, |f| parse_event(f, &lk, &mut st.raw, &mut st.slab));
+                csv::release(data, s, e);
             } else {
                 let (data, s, e) = click_chunks[t - nl - ne];
                 csv::rows::<4>(data, s, e, |f| parse_click(f, &lk, &mut st.clicks, &mut st.slab));
+                csv::release(data, s, e);
             }
         },
     );
@@ -1140,12 +1201,17 @@ fn main() {
                 let copies = std::mem::take(&mut *by_bucket[b].lock().unwrap());
                 let mut batch = Batch::new((0u32, 0u32));
                 let mut sink = |person: Key, (ts, pc): (u32, u32)| events[bucket(person)].push(slab, Event { person, ts, pc });
-                dedup.winners(sizes[b], copies.iter().flat_map(|c| c.slices()).flatten(), |e| {
+                let slices: Vec<&[Raw]> = copies.iter().flat_map(|c| c.slices()).collect();
+                dedup.winners(sizes[b], &slices, |e| {
                     if e.ts != INVALID {
                         batch.push(&names, e.uid, (e.ts, e.pc), &mut sink);
                     }
                 });
                 batch.flush(&names, &mut sink);
+                // Nothing reads these copies again: their memory serves the
+                // events and clicks routed next, already faulted in.
+                drop(slices);
+                copies.into_iter().for_each(Bucket::recycle);
             } else {
                 let mut batch = Batch::new((0u64, 0u32, 0u32));
                 let mut sink = |person: Key, (cid, ts, campaign): (Key, u32, u32)| {
@@ -1206,4 +1272,126 @@ fn main() {
     lap("write");
     // Everything is written and closed: skip freeing the buffers.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    /// Dedup keeps the smallest `ingest` per ID, also when most IDs collide on
+    /// the same mark bit (tiny `len`) and when the mark table is roomy.
+    #[test]
+    fn dedup_keeps_earliest_copy_under_collisions() {
+        let mut rng = 7u64;
+        for &(ids, copies, len_hint) in &[(40usize, 300usize, 3usize), (500, 700, 700), (2000, 2100, 2100), (5, 400, 1)] {
+            let raws: Vec<Raw> = (0..copies)
+                .map(|i| {
+                    let eid = if i < ids { i as Key + 1 } else { lcg(&mut rng) % ids as u64 + 1 };
+                    let ingest = (lcg(&mut rng) % 50) as i64;
+                    // Equal ingest means identical copies: derive the rest from it.
+                    Raw { eid, uid: eid * 3, ingest, ts: ingest as u32 * 7 + eid as u32, pc: ingest as u32 }
+                })
+                .collect();
+            let mut expected: std::collections::HashMap<Key, Raw> = std::collections::HashMap::new();
+            for r in &raws {
+                let best = expected.entry(r.eid).or_insert(*r);
+                if r.ingest < best.ingest {
+                    *best = *r;
+                }
+            }
+            let (a, b) = raws.split_at(raws.len() / 3);
+            let mut got = Vec::new();
+            Dedup::default().winners(len_hint, &[a, b], |e| got.push((e.eid, e.ingest, e.ts, e.pc)));
+            got.sort_unstable();
+            let mut want: Vec<_> = expected.values().map(|e| (e.eid, e.ingest, e.ts, e.pc)).collect();
+            want.sort_unstable();
+            assert_eq!(got, want);
+        }
+    }
+
+    /// Every linked ID resolves to the smallest ID of its chain; others to themselves.
+    #[test]
+    fn names_resolve_through_filter_and_collisions() {
+        let ids = Interner::new();
+        let mut pairs = Vec::new();
+        let mut expected = Vec::new();
+        let mut rng = 11u64;
+        let mut next = 0u32;
+        for group in 0..3000u32 {
+            let len = 2 + (lcg(&mut rng) % 5) as u32 + if group % 500 == 0 { 300 } else { 0 };
+            let members: Vec<u32> = (0..len).map(|_| { next += 1 + (lcg(&mut rng) % 3) as u32; next }).collect();
+            let id = |n: u32| format!("u{:07}", n.wrapping_mul(2654435761) % 10_000_000);
+            let mut shuffled = members.clone();
+            for i in (1..shuffled.len()).rev() {
+                shuffled.swap(i, (lcg(&mut rng) % (i as u64 + 1)) as usize);
+            }
+            for w in shuffled.windows(2) {
+                pairs.push((ids.key(id(w[0]).as_bytes()), ids.key(id(w[1]).as_bytes())));
+            }
+            let name = members.iter().map(|&m| id(m)).min().unwrap();
+            for &m in &members {
+                expected.push((ids.key(id(m).as_bytes()), ids.key(name.as_bytes())));
+            }
+        }
+        let names = Names::build(vec![pairs], &ids);
+        for &(k, name) in &expected {
+            assert_eq!(names.resolve(k, names.locate(k)), name);
+        }
+        for n in 0..5000u32 {
+            let k = ids.key(format!("x{n}").as_bytes());
+            assert_eq!(names.resolve(k, names.locate(k)), k);
+        }
+        // Through the sliding window, in order.
+        let mut batch = Batch::new(0u32);
+        let mut got = Vec::new();
+        for (i, &(k, _)) in expected.iter().enumerate() {
+            batch.push(&names, k, i as u32, &mut |name, i| got.push((i, name)));
+        }
+        batch.flush(&names, &mut |name, i| got.push((i, name)));
+        assert_eq!(got.len(), expected.len());
+        for (i, name) in got {
+            assert_eq!(name, expected[i as usize].1);
+        }
+    }
+}
+
+/// `lookups` reads products.csv through the row scanner: categories are
+/// numbered in byte order with `unknown` among them, quotes are unwrapped,
+/// the first row of a repeated product wins, and rows without a product_id
+/// are skipped.
+#[cfg(test)]
+#[test]
+fn lookups_number_categories_in_byte_order() {
+    let dir = std::env::temp_dir().join(format!("lookups-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("manifest.json"),
+        r#"{"window_start": "2026-10-01T00:00:00Z", "window_end": "2026-10-15T00:00:00Z"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("products.csv"),
+        "product_id,category\np1,toys\n\"p2\",\"books\"\np3,toys\n,ghost\np1,games\np4,\np5,Books\np6,unknown\nbad\"row,x\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,email\n").unwrap();
+    let lk = lookups(&dir).unwrap();
+    let names: Vec<&[u8]> = lk.categories.iter().map(|c| c.as_slice()).collect();
+    // "" (p4) sorts first, then byte order. Categories of repeated rows count.
+    assert_eq!(names, [&b""[..], b"Books", b"books", b"games", b"toys", b"unknown"]);
+    assert_eq!(lk.unknown, 5);
+    let category = |p: &[u8]| lk.products.get(&lk.ids.key(p)).copied();
+    assert_eq!(category(b"p1"), Some(4));
+    assert_eq!(category(b"p2"), Some(2));
+    assert_eq!(category(b"p3"), Some(4));
+    assert_eq!(category(b"p4"), Some(0));
+    assert_eq!(category(b"p5"), Some(1));
+    assert_eq!(category(b"p6"), Some(5));
+    assert_eq!(category(b"ghost"), None);
+    std::fs::remove_dir_all(&dir).unwrap();
 }

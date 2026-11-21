@@ -8,6 +8,8 @@
 
 use std::mem::size_of;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Mutex;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -22,15 +24,24 @@ const REFILL: usize = 32 << 20;
 /// A multiple of 64, so every chunk starts on a cache line.
 pub const CHUNK_BYTES: usize = 32 << 10;
 
+/// Chunks whose contents are dead (see `Bucket::recycle`), for any thread to
+/// reuse instead of faulting in fresh, zeroed memory.
+static POOL: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static POOL_LEN: AtomicUsize = AtomicUsize::new(0);
+/// How many pooled chunks a thread takes at a time.
+const POOL_TAKE: usize = 16;
+
 /// One thread's supply of chunks.
 pub struct Slab {
     cur: usize,
     end: usize,
+    /// Recycled chunks taken from the pool.
+    spare: Vec<usize>,
 }
 
 impl Slab {
     pub fn new() -> Self {
-        Slab { cur: 0, end: 0 }
+        Slab { cur: 0, end: 0, spare: Vec::new() }
     }
 
     #[cold]
@@ -48,6 +59,20 @@ impl Slab {
 
     #[inline]
     fn take(&mut self) -> *mut u8 {
+        if let Some(p) = self.spare.pop() {
+            return p as *mut u8;
+        }
+        if POOL_LEN.load(Relaxed) != 0 {
+            let mut pool = POOL.lock().unwrap();
+            let n = pool.len().min(POOL_TAKE);
+            let at = pool.len() - n;
+            self.spare.extend(pool.drain(at..));
+            POOL_LEN.store(pool.len(), Relaxed);
+            drop(pool);
+            if let Some(p) = self.spare.pop() {
+                return p as *mut u8;
+            }
+        }
         if self.cur + CHUNK_BYTES > self.end {
             self.refill();
         }
@@ -95,6 +120,13 @@ impl<T: Copy> Bucket<T> {
         self.cur = p;
         // Safety: a chunk holds CAP elements.
         self.end = unsafe { p.add(Self::CAP) };
+    }
+
+    /// Hands the chunks to the pool: for a list nothing reads any more.
+    pub fn recycle(self) {
+        let mut pool = POOL.lock().unwrap();
+        pool.extend(self.chunks.iter().map(|&p| p as usize));
+        POOL_LEN.store(pool.len(), Relaxed);
     }
 
     pub fn len(&self) -> usize {
