@@ -1,0 +1,3 @@
+# The scorers are Cascade Lake or newer (AVX-512); x86-64-v3 (AVX2) runs there and on dev machines.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

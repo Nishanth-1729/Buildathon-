@@ -1,0 +1,12 @@
+# Toolchains, caches and the virtual environment (see env.sh)
+/.tools/
+/.venv/
+# Build output, generated data and run output
+/target/
+/data/
+/out/
+/out-*/
+# Downloads: starters, generator, dev answer
+*.zip
+/dev-answer/
+__pycache__/

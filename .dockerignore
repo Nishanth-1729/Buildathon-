@@ -1,0 +1,6 @@
+# Only the sources go into the build context; data and toolchains stay out.
+*
+!Cargo.toml
+!Cargo.lock
+!.cargo
+!src
