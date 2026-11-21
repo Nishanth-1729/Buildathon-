@@ -6,11 +6,19 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo .cargo
 COPY src src
-COPY scripts/build_pgo.sh scripts/pgo_train.rs scripts/
-RUN if rustup component add llvm-tools-preview && sh scripts/build_pgo.sh; then \
-        :; \
+COPY scripts/build_pgo.sh scripts/pgo_train.rs scripts/train_public.sh scripts/
+ARG PUBLIC_PGO=1
+RUN if rustup component add llvm-tools-preview; then \
+        if [ "$PUBLIC_PGO" = 1 ] && apt-get update && \
+                apt-get install -y --no-install-recommends ca-certificates curl unzip && \
+                sh scripts/train_public.sh; then \
+            :; \
+        else \
+            echo "Using the bundled compiler training workload" >&2; \
+            sh scripts/build_pgo.sh || cargo build --release --locked; \
+        fi; \
     else \
-        echo "Profiling unavailable, building the standard release" >&2; \
+        echo "Profiling tools unavailable, building the standard release" >&2; \
         cargo build --release --locked; \
     fi
 

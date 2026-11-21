@@ -28,7 +28,7 @@ Five measured runs after warmup used the public 20M dataset with seed 21, Rust 1
 | `e3ef48c` | 1.121 s | 3,433 MiB |
 | Optimized with PGO | 0.892 s | 2,708 MiB |
 
-The Docker build trains profile-guided optimization (PGO) on generated synthetic events. It copies only the final binary to the runtime image and falls back to the standard release build if profiling is unavailable. The same build can be run locally with `rustup component add llvm-tools-preview` followed by `sh scripts/build_pgo.sh`.
+The Docker build trains profile-guided optimization (PGO) on generated events and copies only the final binary to the runtime image. See the public-data PGO benchmark below for the training and fallback options.
 
 ## Earlier results on the dev machine
 
@@ -83,3 +83,47 @@ The candidate passed 19 Rust tests, all 36 official fixtures, and the
 official 1M-event dev answer. Both Parquet tables match the base commit
 on all four workloads above and the Python reference on three additional
 80,000-event datasets. These timings are local to the benchmark host.
+
+## Public-data PGO benchmark
+
+The default build downloads the official generator and verifies its checksum.
+It trains the compiler on three executions of the public 1M-event dev
+workload using atomic profile counters. The resulting binary computes both
+tables from the mounted input each time it runs. A failed download or
+training run falls back to the bundled workload. A build without profiling
+tools falls back to the standard release. Use the build argument
+`PUBLIC_PGO=0` to select the bundled workload explicitly.
+
+For a native A/B comparison with Rust 1.85, run this from the repository root
+with `curl` and `unzip` installed.
+
+```sh
+rustup component add llvm-tools-preview
+sh scripts/build_pgo.sh
+cp target/release/shopping-sessions ./baseline
+sh scripts/train_public.sh
+python3 scripts/bench_compare.py /path/to/generated-20m ./baseline target/release/shopping-sessions --runs 9
+```
+
+These tests alternated the candidate and commit `5a14571` with eight pinned
+vCPUs on an AMD EPYC 9V45. Each run used a fresh output directory. The change
+columns give the median of the per-pair wall-time changes. Negative is faster.
+
+| Workload | First three-run build | Independent three-run rebuild |
+| --- | ---: | ---: |
+| 20M, seed 21 | −4.1% | −6.6% |
+| 20M, seed 43 | −6.9% | −1.7% |
+| 60M, seed 61 | −2.1% | −2.2% |
+| 20M, seed 21, input eviction requested | | −0.1% |
+
+Earlier single-run public profiles gave mixed results across rebuilds. On
+20M warm runs, the base binary spent about half its wall time mapping,
+reading, and parsing input. A separate ID census added another scan and took
+over three times as long end to end. The alternate AVX-512 scanner, smaller
+dedup records, and session bitmap gave slower or inconsistent results.
+
+The Rust source passed 19 unit tests. The independent three-run rebuild
+passed all 36 official fixtures and the public dev answer. Both tables
+also matched `5a14571` exactly on the two 20M seeds and the 60M seed.
+The build scripts were exercised natively. Docker and the official scorer
+were outside this verification.

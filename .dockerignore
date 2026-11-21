@@ -8,3 +8,4 @@
 scripts/*
 !scripts/build_pgo.sh
 !scripts/pgo_train.rs
+!scripts/train_public.sh
