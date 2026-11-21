@@ -124,6 +124,8 @@ struct Lookups {
     unknown: u8,
     /// campaign key -> index; `organic` is index `channels.len()`.
     campaigns: KeyMap<u32>,
+    /// `campaign_number` of every campaign ID that has one -> index + 1 (0: none).
+    campaign_table: Vec<u32>,
     campaign_names: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
     first_day: i64,
@@ -243,6 +245,15 @@ fn lookups(data: &Path) -> Option<Lookups> {
             channels.push(ch);
         }
     }
+    let mut campaign_table: Vec<u32> = Vec::new();
+    for (i, name) in campaign_names.iter().enumerate() {
+        if let Some(n) = campaign_number(name) {
+            if campaign_table.len() <= n {
+                campaign_table.resize(n + 1, 0);
+            }
+            campaign_table[n] = i as u32 + 1;
+        }
+    }
     let first_day = window_start.div_euclid(DAY);
     let days = ((window_end - 1).div_euclid(DAY) - first_day + 1).max(1) as usize;
     Some(Lookups {
@@ -254,6 +265,7 @@ fn lookups(data: &Path) -> Option<Lookups> {
         categories,
         unknown,
         campaigns,
+        campaign_table,
         campaign_names,
         channels,
         first_day,
@@ -481,7 +493,7 @@ fn parse_event(f: &[&[u8]; 7], lk: &Lookups, out: &mut [Bucket<Raw>], slab: &mut
     if f[0].is_empty() {
         return;
     }
-    let ingest = ts::parse(f[3]).unwrap_or(i64::MAX);
+    let ingest = ts::parse_f1_first(f[3]).unwrap_or(i64::MAX);
     let mut raw = Raw { eid: lk.ids.key(f[0]), uid: 0, ingest, ts: INVALID, pc: 0 };
     'valid: {
         if f[1].is_empty() || f[5].is_empty() {
@@ -509,6 +521,28 @@ fn parse_event(f: &[&[u8]; 7], lk: &Lookups, out: &mut [Bucket<Raw>], slab: &mut
     out[bucket(raw.eid)].push(slab, raw);
 }
 
+/// The number in an ID of the form `c_` + 2 to 4 digits without a leading
+/// zero (`c_10`..`c_9999`), the shape of the generator's campaign IDs. Each
+/// such string has its own number, so a table indexed by it is exact.
+#[inline(always)]
+fn campaign_number(id: &[u8]) -> Option<usize> {
+    let n = id.len();
+    if !(4..=6).contains(&n) || id[0] != b'c' || id[1] != b'_' || id[2] == b'0' {
+        return None;
+    }
+    // The last four bytes hold the digits (n - 2 of them), preceded by the
+    // end of "c_" when there are fewer than four: make those bytes '0'.
+    let word = u32::from_le_bytes([id[n - 4], id[n - 3], id[n - 2], id[n - 1]]);
+    let pad = (1u32 << (8 * (6 - n))) - 1;
+    let x = ((word & !pad) | (0x3030_3030 & pad)) ^ 0x3030_3030;
+    // Every byte of x must be a digit 0..=9.
+    if ((x.wrapping_add(0x7676_7676)) | x) & 0x8080_8080 != 0 {
+        return None;
+    }
+    let pairs = (x * 10 + (x >> 8)) & 0x00ff_00ff;
+    Some(((pairs & 0xffff) * 100 + (pairs >> 16)) as usize)
+}
+
 #[inline(always)]
 fn parse_click(f: &[&[u8]; 4], lk: &Lookups, out: &mut Bucket<Click>, slab: &mut Slab) {
     if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
@@ -518,7 +552,14 @@ fn parse_click(f: &[&[u8]; 4], lk: &Lookups, out: &mut Bucket<Click>, slab: &mut
     if ts < lk.base || ts >= lk.window_end {
         return;
     }
-    let Some(&campaign) = lk.campaigns.get(&lk.ids.key(f[2])) else { return };
+    let campaign = match campaign_number(f[2]).and_then(|n| lk.campaign_table.get(n)) {
+        Some(&slot) if slot != 0 => slot - 1,
+        // Not of the form `c_123`, or not a campaign: the exact map decides.
+        _ => match lk.campaigns.get(&lk.ids.key(f[2])) {
+            Some(&campaign) => campaign,
+            None => return,
+        },
+    };
     out.push(slab, Click { person: lk.ids.key(f[1]), cid: lk.ids.key(f[0]), ts: (ts - lk.base) as u32, campaign });
 }
 
@@ -1538,4 +1579,35 @@ fn lookups_number_categories_in_byte_order() {
     assert_eq!(category(b"p6"), Some(5));
     assert_eq!(category(b"ghost"), None);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `campaign_number` accepts exactly `c_` + 2..=4 digits, first not '0', and
+/// reads the same number as the plain digit loop.
+#[cfg(test)]
+#[test]
+fn campaign_numbers_match_plain_parse() {
+    fn plain(id: &[u8]) -> Option<usize> {
+        let digits = id.strip_prefix(b"c_")?;
+        if !(2..=4).contains(&digits.len()) || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(digits.iter().fold(0, |v, &d| v * 10 + (d - b'0') as usize))
+    }
+    let alphabet = b"c_0159:/xC";
+    let mut id = Vec::new();
+    for len in 0..=7usize {
+        let total = alphabet.len().pow(len as u32);
+        for mut code in 0..total {
+            id.clear();
+            for _ in 0..len {
+                id.push(alphabet[code % alphabet.len()]);
+                code /= alphabet.len();
+            }
+            assert_eq!(campaign_number(&id), plain(&id), "{:?}", String::from_utf8_lossy(&id));
+        }
+    }
+    for n in 10..10_000 {
+        let id = format!("c_{n}");
+        assert_eq!(campaign_number(id.as_bytes()), Some(n));
+    }
 }

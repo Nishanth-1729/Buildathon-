@@ -10,14 +10,54 @@ pub type Key = u64;
 
 pub const INTERNED: Key = 1 << 63;
 const ASCII_LANES: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+/// Interned strings live in this many independently locked tables, chosen by
+/// the string's hash, so threads interning different IDs rarely meet.
+const SHARDS: usize = 64;
+const SHARD_BITS: u32 = 6;
+
+#[derive(Default)]
+struct Shard {
+    ids: HashMap<Box<[u8]>, u64, BuildHasherDefault<BytesHasher>>,
+    strings: Vec<Box<[u8]>>,
+}
 
 pub struct Interner {
-    inner: Mutex<(HashMap<Vec<u8>, u32>, Vec<Vec<u8>>)>,
+    shards: Vec<Mutex<Shard>>,
+}
+
+/// Hashes a byte string eight bytes at a time.
+#[derive(Default)]
+struct BytesHasher(u64);
+
+impl Hasher for BytesHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(word));
+        }
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = hash(self.0 ^ v);
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+}
+
+fn shard_of(s: &[u8]) -> usize {
+    let mut h = BytesHasher::default();
+    h.write(s);
+    h.write_usize(s.len());
+    (h.finish() >> 58) as usize % SHARDS
 }
 
 impl Interner {
     pub fn new() -> Self {
-        Interner { inner: Mutex::new((HashMap::new(), Vec::new())) }
+        Interner { shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect() }
     }
 
     #[inline]
@@ -40,24 +80,26 @@ impl Interner {
 
     #[cold]
     fn intern(&self, s: &[u8]) -> Key {
-        let mut guard = self.inner.lock().unwrap();
-        let (map, strings) = &mut *guard;
-        let id = if let Some(&id) = map.get(s) {
+        let shard = shard_of(s);
+        let mut guard = self.shards[shard].lock().unwrap();
+        let Shard { ids, strings } = &mut *guard;
+        let id = if let Some(&id) = ids.get(s) {
             id
         } else {
-            let id = strings.len() as u32;
-            strings.push(s.to_vec());
-            map.insert(s.to_vec(), id);
+            let id = (strings.len() as u64) << SHARD_BITS | shard as u64;
+            strings.push(s.into());
+            ids.insert(s.into(), id);
             id
         };
-        INTERNED | id as Key
+        INTERNED | id
     }
 
     /// The bytes of a key, appended to `out`.
     pub fn bytes(&self, k: Key, out: &mut Vec<u8>) {
         if k & INTERNED != 0 {
-            let guard = self.inner.lock().unwrap();
-            out.extend_from_slice(&guard.1[(k & !INTERNED) as usize]);
+            let id = k & !INTERNED;
+            let guard = self.shards[(id % SHARDS as u64) as usize].lock().unwrap();
+            out.extend_from_slice(&guard.strings[(id >> SHARD_BITS) as usize]);
         } else {
             let b = unpack(k >> 7).to_be_bytes();
             let len = 8 - (u64::from_be_bytes(b).trailing_zeros() as usize / 8);
@@ -153,5 +195,38 @@ mod tests {
                 assert_eq!(ids.cmp(ka, kb), a.cmp(b));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod intern_tests {
+    use super::Interner;
+
+    /// Threads interning overlapping long IDs agree on every key, and each key
+    /// reads back its string; the keys order like the strings.
+    #[test]
+    fn long_ids_across_threads() {
+        let ids = Interner::new();
+        let make = |i: usize| format!("u{:0width$}", i * 7919 % 5003, width = 9 + i % 3).into_bytes();
+        let results: Vec<Vec<u64>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|t| {
+                    let ids = &ids;
+                    s.spawn(move || (0..5003).map(|i| ids.key(&make((i + t * 1000) % 5003))).collect::<Vec<_>>())
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for t in 0..4 {
+            for i in 0..5003 {
+                let want = make((i + t * 1000) % 5003);
+                assert_eq!(results[t][i], ids.key(&want));
+                let mut got = Vec::new();
+                ids.bytes(results[t][i], &mut got);
+                assert_eq!(got, want);
+            }
+        }
+        let (a, b) = (ids.key(&make(1)), ids.key(&make(2)));
+        assert_eq!(ids.cmp(a, b), make(1).cmp(&make(2)));
     }
 }

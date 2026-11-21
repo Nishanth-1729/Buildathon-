@@ -79,48 +79,57 @@ static MONTHS: [i32; TABLE_YEARS * 12] = {
     t
 };
 
-/// Epoch seconds of `YYYY-MM-DDTHH:MM:SS` in s[..19] (s.len() >= 19), or None
+/// Epoch seconds of `YYYY-MM-DDTHH:MM:SS` in s[..19] (s.len() >= 20), or None
 /// unless it is a valid calendar date and time.
-#[cfg(target_feature = "ssse3")]
+#[cfg(target_feature = "sse4.1")]
 #[inline(always)]
 fn civil_seconds(s: &[u8]) -> Option<i64> {
     use std::arch::x86_64::*;
-    // Safety: s has at least 19 bytes, so both loads are inside it; SSSE3 is enabled.
-    let fields: [u16; 8] = unsafe {
-        let v = _mm_loadu_si128(s.as_ptr().cast());
-        let literals = _mm_setr_epi8(0, 0, 0, 0, 45, 0, 0, 45, 0, 0, 84, 0, 0, 58, 0, 0);
-        const SEPARATORS: i32 = (1 << 4) | (1 << 7) | (1 << 10) | (1 << 13);
-        const DIGITS: i32 = 0xffff & !SEPARATORS;
-        let same = _mm_movemask_epi8(_mm_cmpeq_epi8(v, literals));
-        let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
-        let digit = _mm_movemask_epi8(_mm_cmpeq_epi8(d, _mm_min_epu8(d, _mm_set1_epi8(9))));
-        if (same & SEPARATORS) != SEPARATORS || (digit & DIGITS) != DIGITS {
-            return None;
-        }
-        let packed = _mm_shuffle_epi8(d, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
-        std::mem::transmute(_mm_maddubs_epi16(packed, _mm_set1_epi16(0x010a)))
-    };
-    let (colon, s1, s2) = (s[16], s[17].wrapping_sub(b'0'), s[18].wrapping_sub(b'0'));
-    let [cc, yy, month, day, hour, minute, ..] = fields;
-    let year = cc as i64 * 100 + yy as i64;
-    let second = s1 as i64 * 10 + s2 as i64;
-    let row = (year - TABLE_YEAR) as usize;
-    if row >= TABLE_YEARS {
+    assert!(s.len() >= 20);
+    // Years 2000..2099 take this path; any other year, or a non-digit in the
+    // year, goes to the scalar parser, which also decides what is valid.
+    let y = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+    let d2 = ((y >> 16) & 0xff).wrapping_sub(b'0' as u32);
+    let d3 = (y >> 24).wrapping_sub(b'0' as u32);
+    if (y & 0xffff) != 0x3032 || (d2 > 9) | (d3 > 9) {
         return civil_seconds_slow(s);
     }
-    let month0 = (month as usize).wrapping_sub(1);
-    let ok = (colon == b':') & (s1 <= 9) & (s2 <= 9) & (month0 < 12) & (hour <= 23) & (minute <= 59) & (second <= 59);
-    if !ok {
+    let row = (100 + d2 * 10 + d3) as usize;
+    // Safety: s has at least 20 bytes, so the 16-byte load of s[4..20] is
+    // inside it; SSE4.1 (and so SSSE3) is enabled.
+    let (lo, second) = unsafe {
+        // -MM-DDTHH:MM:SS and the byte after the seconds.
+        let v = _mm_loadu_si128(s.as_ptr().add(4).cast());
+        let pattern = _mm_setr_epi8(45, 48, 48, 45, 48, 48, 84, 48, 48, 58, 48, 48, 58, 48, 48, 0);
+        let limit = _mm_setr_epi8(0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, -1);
+        // Digits become 0..=9 and separators 0 when the bytes are right.
+        let t = _mm_sub_epi8(v, pattern);
+        let shape = _mm_cmpeq_epi8(_mm_min_epu8(t, limit), t);
+        let packed = _mm_shuffle_epi8(t, _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1));
+        // Lanes: month, day, hour, minute, second, 0, 0, 0.
+        let pairs = _mm_maddubs_epi16(packed, _mm_set1_epi16(0x010a));
+        // Month and day count from 0 here: a 0 wraps to 0xffff and fails.
+        let x = _mm_sub_epi16(pairs, _mm_setr_epi16(1, 1, 0, 0, 0, 0, 0, 0));
+        let max = _mm_setr_epi16(11, 30, 23, 59, 59, -1, -1, -1);
+        let range = _mm_cmpeq_epi16(_mm_min_epu16(x, max), x);
+        if _mm_movemask_epi8(_mm_and_si128(shape, range)) != 0xffff {
+            return None;
+        }
+        (_mm_cvtsi128_si64(x) as u64, _mm_extract_epi16(x, 4) as i64)
+    };
+    let month0 = (lo & 0xffff) as usize;
+    let day0 = (lo >> 16) & 0xffff;
+    let hour = (lo >> 32) & 0xffff;
+    let minute = lo >> 48;
+    // Safety: month0 < 12 was checked above and row < 200.
+    let m = unsafe { *MONTHS.get_unchecked(row * 12 + month0) };
+    if day0 as i32 >= (m & 0xff) {
         return None;
     }
-    let m = MONTHS[row * 12 + month0];
-    if day == 0 || day as i32 > (m & 0xff) {
-        return None;
-    }
-    Some(((m >> 8) as i64 + day as i64 - 1) * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second)
+    Some(((m >> 8) as i64 + day0 as i64) * 86_400 + (hour * 3_600 + minute * 60) as i64 + second)
 }
 
-#[cfg(not(target_feature = "ssse3"))]
+#[cfg(not(target_feature = "sse4.1"))]
 #[inline(always)]
 fn civil_seconds(s: &[u8]) -> Option<i64> {
     civil_seconds_slow(s)
@@ -156,10 +165,25 @@ pub fn parse(s: &[u8]) -> Option<i64> {
             let offset = if s[19] == b'+' { h * 60 + m } else { -(h * 60 + m) };
             civil_seconds(s).map(|v| v * 1_000 - offset * 60_000)
         }
-        #[cfg(target_feature = "ssse3")]
+        #[cfg(target_feature = "sse4.1")]
         13 => digits_13(s),
         _ => digits(s),
     }
+}
+
+/// `parse` for a field that is almost always F1 (`ingest_ts`): tests F1
+/// first, so the common case is one predictable branch.
+#[inline(always)]
+pub fn parse_f1_first(s: &[u8]) -> Option<i64> {
+    if s.len() == 20 && s[19] == b'Z' {
+        return civil_seconds(s).map(|v| v * 1_000);
+    }
+    parse_cold(s)
+}
+
+#[inline(never)]
+fn parse_cold(s: &[u8]) -> Option<i64> {
+    parse(s)
 }
 
 /// The previous parser, kept as the reference for the tests.
@@ -175,7 +199,7 @@ pub fn parse_reference(s: &[u8]) -> Option<i64> {
             if s[19] == b'+' { h * 60 + m } else { -(h * 60 + m) }
         }
         _ => {
-            #[cfg(target_feature = "ssse3")]
+            #[cfg(target_feature = "sse4.1")]
             if s.len() == 13 {
                 return digits_13(s);
             }
@@ -194,7 +218,7 @@ pub fn parse_reference(s: &[u8]) -> Option<i64> {
     Some(seconds * 1_000 - offset_minutes * 60_000)
 }
 
-#[cfg(target_feature = "ssse3")]
+#[cfg(target_feature = "sse4.1")]
 #[inline]
 fn digits_13(s: &[u8]) -> Option<i64> {
     use std::arch::x86_64::*;
@@ -216,7 +240,7 @@ fn digits_13(s: &[u8]) -> Option<i64> {
     }
 }
 
-#[cfg(all(test, target_feature = "ssse3"))]
+#[cfg(all(test, target_feature = "sse4.1"))]
 #[inline]
 fn civil_fields(s: &[u8]) -> Option<[i64; 5]> {
     use std::arch::x86_64::*;
@@ -244,7 +268,7 @@ fn civil_fields(s: &[u8]) -> Option<[i64; 5]> {
     }
 }
 
-#[cfg(all(test, not(target_feature = "ssse3")))]
+#[cfg(all(test, not(target_feature = "sse4.1")))]
 #[inline]
 fn civil_fields(s: &[u8]) -> Option<[i64; 5]> {
     if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
@@ -291,6 +315,42 @@ mod tests {
         }
     }
 
+
+    /// Every byte value at every position of valid forms agrees with the
+    /// reference, and so do the calendar edges of the table path.
+    #[test]
+    fn single_byte_mutations_and_edges() {
+        let seeds: [&[u8]; 5] = [
+            b"2026-10-03T23:58:10Z", b"2000-02-29T00:00:00Z", b"2099-12-31T23:59:59Z",
+            b"2026-10-03T19:58:10-04:00", b"1791071890000",
+        ];
+        for seed in seeds {
+            for at in 0..seed.len() {
+                for b in 0..=255u8 {
+                    let mut s = seed.to_vec();
+                    s[at] = b;
+                    assert_eq!(parse(&s), parse_reference(&s), "{:?}", String::from_utf8_lossy(&s));
+                }
+            }
+        }
+        for year in [1899, 1900, 1999, 2000, 2001, 2024, 2028, 2099, 2100, 2199, 2200] {
+            for month in 0..=13 {
+                for day in [0, 1, 28, 29, 30, 31, 32] {
+                    for (h, m, sec) in [(0, 0, 0), (23, 59, 59), (24, 0, 0), (0, 60, 0), (0, 0, 60), (12, 34, 56)] {
+                        let s = format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{sec:02}Z");
+                        assert_eq!(parse(s.as_bytes()), parse_reference(s.as_bytes()), "{s}");
+                        let s = format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{sec:02}+05:30");
+                        assert_eq!(parse(s.as_bytes()), parse_reference(s.as_bytes()), "{s}");
+                    }
+                }
+            }
+        }
+        assert_eq!(parse(b"2000-02-29T00:00:00Z"), Some(951_782_400_000));
+        assert_eq!(parse(b"2100-02-29T00:00:00Z"), None);
+        assert_eq!(parse(b"2026-00-10T00:00:00Z"), None);
+        assert_eq!(parse(b"2026-04-31T00:00:00Z"), None);
+        assert_eq!(parse(b"2026-04-30T00:00:00Z"), Some(1_777_507_200_000));
+    }
     #[test]
     fn forms() {
         let f1 = parse(b"2026-10-03T23:58:10Z").unwrap();
