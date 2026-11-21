@@ -281,6 +281,65 @@ fn civil_seconds_cached(s: &[u8], _cache: &mut DateCache) -> Option<i64> {
     civil_seconds(s)
 }
 
+/// When two UTC timestamps share a day, parse their clocks in parallel and
+/// use one date lookup. Other formats and invalid pairs use the ordinary
+/// parser so an invalid event can still take part in deduplication.
+#[cfg(all(target_feature = "avx2", target_feature = "sse4.1"))]
+#[inline(always)]
+pub fn utc_pair(event: &[u8], ingest: &[u8], cache: &mut DateCache) -> Option<(i64, i64)> {
+    use std::arch::x86_64::*;
+    if event.len() != 20 || ingest.len() != 20 || event[19] != b'Z' || ingest[19] != b'Z' {
+        return None;
+    }
+    let a = u64::from_le_bytes(event[..8].try_into().unwrap());
+    let b = u32::from_le_bytes(event[8..12].try_into().unwrap()) & 0xff_ffff;
+    if a != u64::from_le_bytes(ingest[..8].try_into().unwrap())
+        || b != (u32::from_le_bytes(ingest[8..12].try_into().unwrap()) & 0xff_ffff)
+    {
+        return None;
+    }
+    let slot = &mut cache.slots[((a ^ ((b as u64) << 40)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize];
+    if slot.a != a || slot.b != b {
+        *slot = Slot { a, b, days: date_days(event)? };
+    }
+    // Each input has 20 bytes. The loads at offset 4 are inside them.
+    unsafe {
+        let x = _mm_loadu_si128(event.as_ptr().add(4).cast());
+        let y = _mm_loadu_si128(ingest.as_ptr().add(4).cast());
+        let v = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(x), y);
+        let pattern = _mm256_broadcastsi128_si256(
+            _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 48, 48, 58, 48, 48, 58, 48, 48, 0));
+        let limit = _mm256_broadcastsi128_si256(
+            _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, 9, 9, 0, 9, 9, 0, 9, 9, -1));
+        let d = _mm256_sub_epi8(v, pattern);
+        let shape = _mm256_cmpeq_epi8(_mm256_min_epu8(d, limit), d);
+        let select = _mm256_broadcastsi128_si256(
+            _mm_setr_epi8(7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+        let units = _mm256_maddubs_epi16(_mm256_shuffle_epi8(d, select), _mm256_set1_epi16(0x010a));
+        let max = _mm256_broadcastsi128_si256(_mm_setr_epi16(23, 59, 59, 0, 0, 0, 0, 0));
+        let range = _mm256_cmpeq_epi16(_mm256_min_epu16(units, max), units);
+        if _mm256_movemask_epi8(_mm256_and_si256(shape, range)) != -1 {
+            return None;
+        }
+        let scale = _mm256_broadcastsi128_si256(_mm_setr_epi16(3600, 60, 1, 0, 0, 0, 0, 0));
+        let time = _mm256_madd_epi16(units, scale);
+        let add = |lane| {
+            let two = _mm_cvtsi128_si64(lane);
+            i64::from(two as i32 + (two >> 32) as i32)
+        };
+        let day = i64::from(slot.days) * DAY;
+        let event = day + add(_mm256_castsi256_si128(time)) * 1000;
+        let ingest = day + add(_mm256_extracti128_si256::<1>(time)) * 1000;
+        Some((event, ingest))
+    }
+}
+
+#[cfg(not(all(target_feature = "avx2", target_feature = "sse4.1")))]
+#[inline(always)]
+pub fn utc_pair(_event: &[u8], _ingest: &[u8], _cache: &mut DateCache) -> Option<(i64, i64)> {
+    None
+}
+
 /// `parse` with the date of F1 and F2 timestamps from `cache`.
 #[inline(always)]
 pub fn parse_cached(s: &[u8], cache: &mut DateCache) -> Option<i64> {
@@ -394,6 +453,33 @@ fn civil_fields(s: &[u8]) -> Option<[i64; 5]> {
 #[cfg(test)]
 mod tests {
     use super::{parse, parse_reference};
+
+    #[cfg(all(target_feature = "avx2", target_feature = "sse4.1"))]
+    #[test]
+    fn paired_utc_clocks_require_valid_matching_dates() {
+        use super::{utc_pair, DateCache};
+
+        let mut cache = DateCache::new();
+        let ingest = b"2028-02-29T23:59:59Z";
+        for event in [b"2028-02-29T00:00:00Z", b"2028-02-29T12:34:56Z", ingest] {
+            assert_eq!(utc_pair(event, ingest, &mut cache), parse(event).zip(parse(ingest)));
+        }
+        for event in [
+            b"2028-03-01T00:00:00Z",
+            b"2028-02-29T24:00:00Z",
+            b"2028-02-29T12:60:00Z",
+            b"2028-02-29T12:00:60Z",
+            b"2028-02-29T12:00:00z",
+            b"2028-02-29T1/:00:00Z",
+            b"2028-02-29T12;00:00Z",
+        ] {
+            assert_eq!(utc_pair(event, ingest, &mut cache), None);
+            assert_eq!(utc_pair(ingest, event, &mut cache), None);
+        }
+        let impossible = b"2028-02-30T12:00:00Z";
+        assert_eq!(utc_pair(impossible, impossible, &mut cache), None);
+    }
+
 
     /// The table-driven parser agrees with the reference on mutated timestamps.
     #[test]

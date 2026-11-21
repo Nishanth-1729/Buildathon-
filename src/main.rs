@@ -493,13 +493,16 @@ fn parse_event(f: &[&[u8]; 7], lk: &Lookups, dates: &mut ts::DateCache, out: &mu
     if f[0].is_empty() {
         return;
     }
-    let ingest = ts::parse_cached(f[3], dates).unwrap_or(i64::MAX);
+    let (time, ingest) = match ts::utc_pair(f[2], f[3], dates) {
+        Some((time, ingest)) => (Some(time), ingest),
+        None => (ts::parse_cached(f[2], dates), ts::parse_cached(f[3], dates).unwrap_or(i64::MAX)),
+    };
     let mut raw = Raw { eid: lk.ids.key(f[0]), uid: 0, ingest, ts: INVALID, pc: 0 };
     'valid: {
         if f[1].is_empty() || f[5].is_empty() {
             break 'valid;
         }
-        let Some(ts) = ts::parse_cached(f[2], dates) else { break 'valid };
+        let Some(ts) = time else { break 'valid };
         if ts < lk.window_start || ts >= lk.window_end || ingest.saturating_sub(ts) > DAY {
             break 'valid;
         }

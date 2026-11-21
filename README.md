@@ -59,3 +59,27 @@ make build fixtures DOCKER=podman DOCKER_OPTS="--security-opt label=disable"
 ```
 
 Datasets come from the published generator, for example `generate --seed 21 --events 20000000 --clicks 5000000 --output data/p20m`.
+
+## Same-day UTC parsing benchmark
+
+When an event and its ingest timestamp have the same UTC date, the
+parser validates and decodes their clocks in parallel with AVX2. Both
+timestamps share one exact date-cache lookup. Different dates, other
+timestamp formats, and invalid timestamps use the existing parser. This
+keeps invalid event copies eligible for deduplication under the rules.
+
+Medians of seven timed runs after a warmup, with interleaved variants,
+on eight pinned vCPUs of an AMD EPYC 9V45 VM. Both builds used
+`scripts/build_pgo.sh`.
+
+| Generated workload | Base `9602d4d` | Paired UTC parsing | Wall time reduction |
+| --- | ---: | ---: | ---: |
+| 20M events, seed 21 | 0.3294 s | 0.2910 s | 11.7% |
+| 20M events, seed 43 | 0.3665 s | 0.3419 s | 6.7% |
+| 20M events, seed 97 | 0.3453 s | 0.3362 s | 2.6% |
+| 60M events, seed 61 | 1.4025 s | 1.2506 s | 10.8% |
+
+The candidate passed 19 Rust tests, all 36 official fixtures, and the
+official 1M-event dev answer. Both Parquet tables match the base commit
+on all four workloads above and the Python reference on three additional
+80,000-event datasets. These timings are local to the benchmark host.
