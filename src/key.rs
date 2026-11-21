@@ -60,7 +60,7 @@ impl Interner {
         Interner { shards: (0..SHARDS).map(|_| Mutex::new(Shard::default())).collect() }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn key(&self, s: &[u8]) -> Key {
         if (8..=9).contains(&s.len()) {
             let head = u64::from_be_bytes(s[..8].try_into().unwrap());

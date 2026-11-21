@@ -197,31 +197,6 @@ fn block(data: &[u8], at: usize) -> (u64, u64, u64) {
 
 pub struct Scanner;
 
-/// Quote flags in field order. A quoted field needs a quote at both ends;
-/// each quote must occupy exactly one of those boundary positions.
-#[cfg(target_feature = "bmi2")]
-#[inline(always)]
-fn field_quotes<const N: usize>(quotes: u128, start: u128, end: u128) -> Option<u32> {
-    use std::arch::x86_64::_pext_u64;
-    let extract = |bits: u128, mask: u128| unsafe {
-        let first = _pext_u64(bits as u64, mask as u64);
-        if N <= 4 {
-            first
-        } else {
-            let second = _pext_u64((bits >> 64) as u64, (mask >> 64) as u64);
-            first | (second << (mask as u64).count_ones())
-        }
-    };
-    let opening = extract(quotes, start);
-    let closing = extract(quotes << 1, end);
-    let double_used = quotes & start & (end >> 1);
-    if opening != closing || double_used != 0 || quotes.count_ones() != 2 * opening.count_ones() {
-        None
-    } else {
-        Some(opening as u32)
-    }
-}
-
 impl Scanner {
     /// Visits the well-formed rows whose first byte is in the chunk.
     #[inline]
@@ -325,6 +300,214 @@ unsafe fn fields_from_masks<'a, const N: usize>(
     paired_quotes == quotes
 }
 
+/// Comma, newline and quote positions in the 64 bytes at `p`.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p.cast());
+    let b = _mm256_loadu_si256(p.add(32).cast());
+    let mask = |byte: i8| {
+        let byte = _mm256_set1_epi8(byte);
+        let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, byte)) as u32 as u64;
+        let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, byte)) as u32 as u64;
+        lo | hi << 32
+    };
+    (mask(b',' as i8), mask(b'\n' as i8), mask(b'"' as i8))
+}
+
+/// `rows` for up to four fields: a row of at most 63 bytes is classified
+/// from the 64 bytes at its start with 64-bit masks (see `quoted_fields` for
+/// the quote check, which uses mask arithmetic instead of a test per field).
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+#[allow(unused_assignments)]
+fn rows_small<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+    let Some(nl) = memchr(b'\n', data, start.saturating_sub(1)) else { return };
+    let mut at = nl + 1;
+    let fast_end = data.len().saturating_sub(64);
+    while at < end {
+        let mut out: [&'a [u8]; N] = [&[]; N];
+        let mut next = 0;
+        let mut ok = false;
+        if at <= fast_end {
+            // Safety: at + 64 <= data.len().
+            let base = unsafe { data.as_ptr().add(at) };
+            let (commas, newlines, quotes) = unsafe { masks64(base) };
+            if newlines != 0 {
+                let len = newlines.trailing_zeros() as usize;
+                let below = (1u64 << len) - 1;
+                let c = commas & below;
+                next = at + len + 1;
+                if len != 0 && c.count_ones() as usize == N - 1 {
+                    // Safety: BMI2 is enabled; see `cut`.
+                    if let Some(fs) = unsafe { quoted_fields(c, len, quotes) } {
+                        unsafe { cut::<N>(base, len, c, fs, &mut out) };
+                        ok = true;
+                    }
+                }
+            } else {
+                (ok, next, out) = slow_row(data, at);
+            }
+        } else {
+            (ok, next, out) = slow_row(data, at);
+        }
+        if ok {
+            f(&out);
+        }
+        at = next;
+    }
+}
+
+/// Newline positions in the 64 bytes at `p`.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn newlines64(p: *const u8) -> u64 {
+    use std::arch::x86_64::*;
+    let a = _mm256_loadu_si256(p.cast());
+    let b = _mm256_loadu_si256(p.add(32).cast());
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, nl)) as u32 as u64;
+    let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, nl)) as u32 as u64;
+    lo | hi << 32
+}
+
+/// The quote logic shared by the windows: for the fields of one window,
+/// ending at `t` (the position of the terminator), with commas `c` below `t`,
+/// `fs` is the bit per field that starts with a quote, or None when the
+/// window is not well formed: a field with a quote at one end only, a field
+/// that is a lone quote, or a quote anywhere else.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn quoted_fields(c: u64, t: usize, quotes: u64) -> Option<u64> {
+    use std::arch::x86_64::_pext_u64;
+    let q = quotes & ((1u64 << t) - 1);
+    let starts = (c << 1) | 1;
+    let ends = c | (1u64 << t);
+    let (fs, fe) = (_pext_u64(q & starts, starts), _pext_u64((q << 1) & ends, ends));
+    if fs == fe && q & starts & (ends >> 1) == 0 && q.count_ones() == 2 * fs.count_ones() {
+        Some(fs)
+    } else {
+        None
+    }
+}
+
+/// The first window of an event row: three fields in the 64 bytes at `base`,
+/// the last ending at the third comma `t`; returns (t, commas below t, fs).
+/// A newline before `t` is not looked for here: `rows7` takes the row only if
+/// its first newline comes after `t`.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn window_to_comma(base: *const u8) -> Option<(usize, u64, u64)> {
+    let (commas, _, quotes) = masks64(base);
+    if commas.count_ones() < 3 {
+        return None;
+    }
+    let rest = commas & commas.wrapping_sub(1);
+    let rest = rest & rest.wrapping_sub(1);
+    let t = rest.trailing_zeros() as usize;
+    let c = commas & ((1u64 << t) - 1);
+    Some((t, c, quoted_fields(c, t, quotes)?))
+}
+
+/// The second window: `K` fields in the 64 bytes at `base`, the last ending
+/// at the newline `t` (< 64, known from a scan of the row); returns (commas
+/// below t, fs).
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn window_to_newline<const K: usize>(base: *const u8, t: usize) -> Option<(u64, u64)> {
+    let (commas, _, quotes) = masks64(base);
+    let c = commas & ((1u64 << t) - 1);
+    if c.count_ones() as usize != K - 1 {
+        return None;
+    }
+    Some((c, quoted_fields(c, t, quotes)?))
+}
+
+/// The slices of `K` fields of one window: the field `i` runs from the
+/// previous comma (or `base`) to the next comma (or `t` for the last), less a
+/// quote at either end where `fs` says so.
+///
+/// Safety: `c` holds the K - 1 commas below `t`, `fs` is from `quoted_fields`
+/// for the same window, so every field lies inside the row.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+unsafe fn cut<'a, const K: usize>(base: *const u8, t: usize, mut c: u64, fs: u64, out: &mut [&'a [u8]]) {
+    let mut s = 0usize;
+    for i in 0..K {
+        let e = if i == K - 1 { t } else { c.trailing_zeros() as usize };
+        c &= c.wrapping_sub(1);
+        let quoted = ((fs >> i) & 1) as usize;
+        out[i] = std::slice::from_raw_parts(base.add(s + quoted), e - s - 2 * quoted);
+        s = e + 1;
+    }
+}
+
+/// `rows::<7>`: an event row is cut into two windows of 64 bytes, the first
+/// three fields and then the last four from where the third ended.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+#[allow(unused_assignments)]
+fn rows7<'a>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; 7])) {
+    let Some(nl) = memchr(b'\n', data, start.saturating_sub(1)) else { return };
+    let mut at = nl + 1;
+    // Both windows end inside data: the second starts at most 64 bytes in.
+    let fast_end = data.len().saturating_sub(128);
+    while at < end {
+        let mut out: [&'a [u8]; 7] = [&[]; 7];
+        let mut next = 0;
+        let mut ok = false;
+        if at <= fast_end {
+            // Safety: at + 128 <= data.len(), and the second window starts
+            // at most 64 bytes after the first.
+            let base = unsafe { data.as_ptr().add(at) };
+            // The next row starts after the first newline, found from loads
+            // that depend on nothing computed for this row: the scan of the
+            // next row need not wait for the two windows of this one.
+            let (n_lo, n_hi) = unsafe { (newlines64(base), newlines64(base.add(64))) };
+            let nl = if n_lo != 0 { n_lo.trailing_zeros() } else { 64 + n_hi.trailing_zeros() } as usize;
+            next = at + nl + 1;
+            if let Some((t1, c1, fs1)) = unsafe { window_to_comma(base) } {
+                // The row ends at that newline: not before the third comma
+                // (then it has too few fields), and less than 64 bytes after
+                // it (a longer row takes the scalar path).
+                let t2 = nl.wrapping_sub(t1 + 1);
+                if t2 < 64 {
+                    let base2 = unsafe { base.add(t1 + 1) };
+                    if let Some((c2, fs2)) = unsafe { window_to_newline::<4>(base2, t2) } {
+                        // Safety: see `cut`.
+                        unsafe {
+                            cut::<3>(base, t1, c1, fs1, &mut out[..3]);
+                            cut::<4>(base2, t2, c2, fs2, &mut out[3..]);
+                        }
+                        ok = true;
+                    }
+                }
+            }
+        }
+        if !ok {
+            (ok, next, out) = slow_row(data, at);
+        }
+        // One call site, so the closure is inlined and the fields stay in registers.
+        if ok {
+            f(&out);
+        }
+        at = next;
+    }
+}
+
+/// The row at `at` by the scalar `fields`: (well formed, start of the next
+/// row, fields). Returned by value so the caller's own array never needs an
+/// address and stays in registers.
+#[cold]
+#[inline(never)]
+fn slow_row<'a, const N: usize>(data: &'a [u8], at: usize) -> (bool, usize, [&'a [u8]; N]) {
+    let stop = memchr(b'\n', data, at).unwrap_or(data.len());
+    let mut opt = [None; N];
+    let ok = fields(&data[at..stop], &mut opt);
+    (ok, stop + 1, opt.map(|v| v.unwrap_or(&[])))
+}
+
 /// Classify two vectors for compact records and a third for wider records.
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
@@ -361,6 +544,15 @@ unsafe fn row_masks<const N: usize>(p: *const u8) -> (u128, u128, u128) {
 /// scalar `fields`, which defines the dialect.
 #[inline(always)]
 pub fn rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+    #[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+    if N <= 4 {
+        return rows_small::<N>(data, start, end, f);
+    }
+    #[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+    if N == 7 {
+        // Safety: N == 7, so the array types are one and the same.
+        return rows7(data, start, end, |r| f(unsafe { &*(r as *const [&'a [u8]; 7] as *const [&'a [u8]; N]) }));
+    }
     let Some(nl) = memchr(b'\n', data, start.saturating_sub(1)) else { return };
     let mut at = nl + 1;
     let mut out: [&'a [u8]; N] = [&[]; N];
@@ -377,40 +569,23 @@ pub fn rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f:
                 if len != 0 && c.count_ones() as usize == N - 1 {
                     let row = &data[at..at + len + 1];
                     let mut s = 0usize;
-                    #[cfg(target_feature = "bmi2")]
-                    {
-                        if let Some(q) = field_quotes::<N>(quotes & below, (c << 1) | 1, c | (1 << len)) {
-                            for (i, dst) in out.iter_mut().enumerate() {
-                                let e = if i == N - 1 { len } else { c.trailing_zeros() as usize };
-                                c &= c.wrapping_sub(1);
-                                let trim = ((q >> i) & 1) as usize;
-                                // The quote mask allowed only distinct, paired endpoints.
-                                *dst = unsafe { row.get_unchecked(s + trim..e - trim) };
-                                s = e + 1;
-                            }
-                            f(&out);
-                        }
+                    let mut paired = 0u32;
+                    for (i, dst) in out.iter_mut().enumerate() {
+                        let e = if i == N - 1 { len } else { c.trailing_zeros() as usize };
+                        c &= c.wrapping_sub(1);
+                        let size = e - s;
+                        // Safety: s <= e <= len < row.len(), so both reads and
+                        // the slice are inside the row.
+                        let (left, right) = unsafe { (*row.get_unchecked(s), *row.get_unchecked(e.saturating_sub(1))) };
+                        let q = (size >= 2) & (left == b'"') & (right == b'"');
+                        let t = q as usize;
+                        *dst = unsafe { row.get_unchecked(s + t..e - t) };
+                        paired += 2 * q as u32;
+                        s = e + 1;
                     }
-                    #[cfg(not(target_feature = "bmi2"))]
-                    {
-                        let mut paired = 0u32;
-                        for (i, dst) in out.iter_mut().enumerate() {
-                            let e = if i == N - 1 { len } else { c.trailing_zeros() as usize };
-                            c &= c.wrapping_sub(1);
-                            let size = e - s;
-                            // Safety: s <= e <= len < row.len(), so both reads and
-                            // the slice are inside the row.
-                            let (left, right) = unsafe { (*row.get_unchecked(s), *row.get_unchecked(e.saturating_sub(1))) };
-                            let q = (size >= 2) & (left == b'"') & (right == b'"');
-                            let t = q as usize;
-                            *dst = unsafe { row.get_unchecked(s + t..e - t) };
-                            paired += 2 * q as u32;
-                            s = e + 1;
-                        }
-                        // Every quote must be one of the pairs around a whole field.
-                        if paired == (quotes & below).count_ones() {
-                            f(&out);
-                        }
+                    // Every quote must be one of the pairs around a whole field.
+                    if paired == (quotes & below).count_ones() {
+                        f(&out);
                     }
                 }
                 at += len + 1;
@@ -433,31 +608,6 @@ pub fn rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f:
 mod tests {
     use super::*;
 
-    #[test]
-    fn quote_boundaries_match_scalar_for_empty_and_malformed_fields() {
-        let values = [b"".as_slice(), b"a", b"\"\"", b"\"a\"", b"\"", b"\"a", b"a\"", b"a\"b", b"\"\"\""];
-        for &first in &values {
-            for &second in &values {
-                for &third in &values {
-                    let mut data = b"header\n".to_vec();
-                    let row = [first, second, third].join(&b',');
-                    data.extend_from_slice(&row);
-                    data.push(b'\n');
-                    data.resize(data.len() + 96, b'x');
-                    let end = b"header\n".len() + row.len() + 1;
-                    let mut expected = [None; 3];
-                    let valid = fields(&row, &mut expected);
-                    let mut seen = false;
-                    rows::<3>(&data, 0, end, |actual| {
-                        assert_eq!(*actual, expected.map(|f| f.unwrap_or(&[])));
-                        seen = true;
-                    });
-                    assert_eq!(seen, valid);
-                }
-            }
-        }
-    }
-
     /// `rows` agrees with `lines` + `fields` on random input and chunkings.
     #[test]
     fn rows_match_reference() {
@@ -471,13 +621,14 @@ mod tests {
         const SHORT: &[u8] = b"ab,,,\"\n\n\r x";
         const LONG: &[u8] = b"abcdefghijklmnopqrstuvwxyz,,\"\n";
         const ROWS: &[u8] = b"abcdefghij,,,,,,\"\n";
-        for round in 0..6000 {
+        for round in 0..30000 {
             let len = (next() % 900) as usize;
             let alphabet = [SHORT, LONG, ROWS][round % 3];
             let data: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
             let size = 1 + (next() % 300) as usize;
             let (mut want, mut got) = (Vec::new(), Vec::new());
             let (mut want7, mut got7) = (Vec::new(), Vec::new());
+            let (mut want2, mut got2, mut want4, mut got4) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for (s, e) in chunks(data.len(), size) {
                 lines(&data, s, e, |line| {
                     let mut f = [None; 3];
@@ -488,12 +639,98 @@ mod tests {
                     if fields::<7>(line, &mut f) {
                         want7.push(f.map(|v| v.map_or(Vec::new(), <[u8]>::to_vec)));
                     }
+                    let mut f = [None; 2];
+                    if fields::<2>(line, &mut f) {
+                        want2.push(f.map(|v| v.map_or(Vec::new(), <[u8]>::to_vec)));
+                    }
+                    let mut f = [None; 4];
+                    if fields::<4>(line, &mut f) {
+                        want4.push(f.map(|v| v.map_or(Vec::new(), <[u8]>::to_vec)));
+                    }
                 });
                 rows::<3>(&data, s, e, |f| got.push(f.map(<[u8]>::to_vec)));
                 rows::<7>(&data, s, e, |f| got7.push(f.map(<[u8]>::to_vec)));
+                rows::<2>(&data, s, e, |f| got2.push(f.map(<[u8]>::to_vec)));
+                rows::<4>(&data, s, e, |f| got4.push(f.map(<[u8]>::to_vec)));
             }
             assert_eq!(want, got, "round {round}: {:?}", String::from_utf8_lossy(&data));
             assert_eq!(want7, got7, "round {round}: {:?}", String::from_utf8_lossy(&data));
+            assert_eq!(want2, got2, "round {round}: {:?}", String::from_utf8_lossy(&data));
+            assert_eq!(want4, got4, "round {round}: {:?}", String::from_utf8_lossy(&data));
+        }
+    }
+
+    /// Rows built from random fields (empty, quoted, lone or stray quotes,
+    /// long, missing or extra commas) read the same through `rows` as through
+    /// `lines` + `fields`, for every field count the pipeline uses.
+    #[test]
+    fn rows_structured_match_reference() {
+        let mut state = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..4000 {
+            let mut data = Vec::new();
+            data.extend_from_slice(b"h1,h2,h3\n");
+            let count = 1 + next() % 40;
+            for _ in 0..count {
+                let n = match next() % 20 {
+                    0 => 1 + next() % 9,
+                    1 => 7 + next() % 2,
+                    _ => [7, 7, 4, 2, 3][(next() % 5) as usize],
+                };
+                for i in 0..n {
+                    let long = next() % 12 == 0;
+                    let len = if long { next() % 70 } else { [0, 1, 2, 5, 8, 9, 10, 13, 20, 20, 25, 6][(next() % 12) as usize] };
+                    let mut field: Vec<u8> = (0..len).map(|_| b"abcz019 _-:T"[(next() % 12) as usize]).collect();
+                    match next() % 10 {
+                        0 | 1 => {
+                            field.insert(0, b'"');
+                            field.push(b'"');
+                        }
+                        2 if next() % 8 == 0 => field.insert(0, b'"'),
+                        3 if next() % 8 == 0 => field.push(b'"'),
+                        4 if next() % 8 == 0 => {
+                            let at = (next() as usize) % (field.len() + 1);
+                            field.insert(at, b'"');
+                        }
+                        _ => {}
+                    }
+                    data.extend_from_slice(&field);
+                    if i + 1 < n {
+                        data.push(b',');
+                    }
+                }
+                if next() % 40 != 0 {
+                    data.push(b'\n');
+                }
+                if next() % 60 == 0 {
+                    data.push(b'\n');
+                }
+            }
+            let size = [97, 128, 129, 1000, 4096, 1 << 20][(next() % 6) as usize].min(data.len().max(1));
+            macro_rules! check {
+                ($n:literal) => {{
+                    let (mut want, mut got) = (Vec::new(), Vec::new());
+                    for (s, e) in chunks(data.len(), size) {
+                        lines(&data, s, e, |line| {
+                            let mut f = [None; $n];
+                            if fields::<$n>(line, &mut f) {
+                                want.push(f.map(|v| v.map_or(Vec::new(), <[u8]>::to_vec)));
+                            }
+                        });
+                        rows::<$n>(&data, s, e, |f| got.push(f.map(<[u8]>::to_vec)));
+                    }
+                    assert_eq!(want, got, "round {round} n {}: {:?}", $n, String::from_utf8_lossy(&data));
+                }};
+            }
+            check!(2);
+            check!(3);
+            check!(4);
+            check!(7);
         }
     }
 

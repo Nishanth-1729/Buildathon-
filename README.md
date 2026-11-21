@@ -8,8 +8,8 @@ Three parallel passes over cache-sized buckets, then the write. Timestamps are k
 
 | Pass | What happens | Code |
 | --- | --- | --- |
-| Parse | AVX2 classifies the first 96 bytes of an event row or 64 bytes of a click or link row. Long rows and file tails use the scalar splitter. Event copies go to 512 buckets by `event_id` hash. Input mappings are released before routing. | [src/csv.rs](src/csv.rs), [src/main.rs](src/main.rs) |
-| Values | F1/F2 timestamps are validated and split with one SSSE3 pass and dated from a month table (1900–2199; other years take the scalar path). F3 has a 13-digit SIMD path. | [src/ts.rs](src/ts.rs) |
+| Parse | AVX2 classifies a row from 64-bit comma, newline and quote masks. An event row is cut into two 64-byte windows (three fields, then four from where the third ended); a click or link row is one window. Quoting is decided with mask arithmetic (`pext` of the quote bits at field starts and ends, no test per field), the next row starts after the first newline found by loads that do not wait for the windows, and long rows, malformed rows and file tails use the scalar splitter. Event copies go to 512 buckets by `event_id` hash. Input mappings are released before routing. | [src/csv.rs](src/csv.rs), [src/main.rs](src/main.rs) |
+| Values | F1/F2 timestamps: the `YYYY-MM-DDT` prefix is looked up in a per-thread cache of validated dates (days since the epoch; a miss validates it with the month table, 1900–2199, other years take the scalar path), and the time of day is validated and summed in one SSSE3/SSE4.1 pass (an F2 offset is read as before). F3 has a 13-digit SIMD path. | [src/ts.rs](src/ts.rs) |
 | IDs | Short ASCII IDs pack into a `u64` whose integer order is the byte order; other IDs are interned. Nothing compares by hash alone. | [src/key.rs](src/key.rs) |
 | Links | Union-find over IDs numbered in byte order, with the smaller number always the root, so a component's root is its name. Linked IDs go into an open-addressing table behind a bit filter. | [src/main.rs](src/main.rs) |
 | Buckets | Records are appended to per-bucket lists of 32 KB chunks carved from per-thread 32 MB huge-page slabs ([src/chunks.rs](src/chunks.rs)): no regrowth, no copies, and about a third of the page faults of growing vectors. | [src/chunks.rs](src/chunks.rs) |
@@ -41,7 +41,7 @@ The Docker build trains profile-guided optimization (PGO) on generated synthetic
 
 ## Verification
 
-- `cargo test --release`: dialect, chunk ownership, randomized scanner-vs-reference tests (block scanner and row scanner, 3 and 7 fields), timestamp forms and a randomized timestamp-vs-reference test, ID packing order, dedup collisions.
+- `cargo test --release`: dialect, chunk ownership, randomized scanner-vs-reference tests (block scanner and row scanner, 2, 3, 4 and 7 fields, also on rows built from random fields with quotes, lone quotes, long fields and missing or extra commas), timestamp forms, and randomized timestamp-vs-reference tests (with and without the date cache), ID packing order, dedup collisions.
 - All 36 fixtures pass with the profiled native build. Both tables match `e3ef48c` at 20M and 60M events.
 - The dev set (seed 1) matches `dev-answer` exactly.
 - [oracle/oracle.py](oracle/oracle.py), an independent plain Python implementation, agrees exactly at 20M (seed 21). At 60M (seed 61) the output matches the previous pipeline exactly.
@@ -59,27 +59,3 @@ make build fixtures DOCKER=podman DOCKER_OPTS="--security-opt label=disable"
 ```
 
 Datasets come from the published generator, for example `generate --seed 21 --events 20000000 --clicks 5000000 --output data/p20m`.
-
-## Parser optimization benchmark
-
-The parser checks CSV quote positions in parallel with BMI2 bit extraction.
-It caches exact calendar-day prefixes near the manifest window and decodes
-common UTC clock fields with validated lookup tables. Other date formats and
-uncached days use the general timestamp parser. The pipeline uses 1,024
-buckets to reduce the working set of each deduplication and session task.
-
-The table compares two profile-guided builds using the same build script.
-Both ran on eight pinned vCPUs on an AMD EPYC 7763 VM. Each row reports the
-median of six timed runs at 20M or four at 60M after one warmup per build,
-with alternating run order. These are local process times.
-
-| Generated input | Base 6474495 | Parser optimization |
-| --- | ---: | ---: |
-| 20M, seed 21 | 0.697 s | 0.667 s |
-| 20M, seed 43 | 0.794 s | 0.757 s |
-| 20M, seed 97 | 0.777 s | 0.677 s |
-| 60M, seed 61 | 3.103 s | 2.800 s |
-
-The profiled binary passes all 36 contest fixtures. Both tables match
-the official dev answer, the Python oracle on a cross-chunk duplicate
-case, and the base commit on the four generated datasets above.

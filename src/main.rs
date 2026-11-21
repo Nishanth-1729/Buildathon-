@@ -34,7 +34,7 @@ use ts::DAY;
 const DAY32: u32 = 86_400_000;
 const GAP: u32 = 1_800_000;
 const REACH: u32 = 7 * DAY32;
-const BUCKETS: usize = 1024;
+const BUCKETS: usize = 512;
 /// Up to this many sessions, assists are found session by session.
 const FEW_SESSIONS: usize = 12;
 const CHUNK: usize = 4 << 20;
@@ -114,7 +114,6 @@ struct Counts {
 
 struct Lookups {
     ids: Interner,
-    time: ts::WindowParser,
     window_start: i64,
     window_end: i64,
     /// window_start - 7 days; every kept timestamp is base + a u32.
@@ -156,7 +155,7 @@ fn run<S: Send>(threads: usize, tasks: usize, init: impl Fn() -> S + Sync, work:
 
 #[inline(always)]
 fn bucket(k: Key) -> usize {
-    (hash(k) >> (64 - BUCKETS.trailing_zeros())) as usize
+    (hash(k) >> 55) as usize % BUCKETS
 }
 
 fn manifest_time(text: &str, name: &str) -> i64 {
@@ -259,7 +258,6 @@ fn lookups(data: &Path) -> Option<Lookups> {
     let days = ((window_end - 1).div_euclid(DAY) - first_day + 1).max(1) as usize;
     Some(Lookups {
         ids,
-        time: ts::WindowParser::new(base, window_end),
         window_start,
         window_end,
         base,
@@ -491,22 +489,26 @@ impl<T: Copy> Batch<T> {
 }
 
 #[inline(always)]
-fn parse_event(f: &[&[u8]; 7], lk: &Lookups, out: &mut [Bucket<Raw>], slab: &mut Slab) {
+fn parse_event(f: &[&[u8]; 7], lk: &Lookups, dates: &mut ts::DateCache, out: &mut [Bucket<Raw>], slab: &mut Slab) {
     if f[0].is_empty() {
         return;
     }
-    let ingest = lk.time.parse_f1_first(f[3]).unwrap_or(i64::MAX);
+    let ingest = ts::parse_cached(f[3], dates).unwrap_or(i64::MAX);
     let mut raw = Raw { eid: lk.ids.key(f[0]), uid: 0, ingest, ts: INVALID, pc: 0 };
     'valid: {
         if f[1].is_empty() || f[5].is_empty() {
             break 'valid;
         }
-        let Some(ts) = lk.time.parse(f[2]) else { break 'valid };
+        let Some(ts) = ts::parse_cached(f[2], dates) else { break 'valid };
         if ts < lk.window_start || ts >= lk.window_end || ingest.saturating_sub(ts) > DAY {
             break 'valid;
         }
+        // `view` and `cart` are told apart from the rest without a branch on
+        // which of the two it is: that is a coin toss in the data.
+        let word = if f[4].len() >= 4 { u32::from_le_bytes([f[4][0], f[4][1], f[4][2], f[4][3]]) } else { 0 };
+        let view_or_cart = (f[4].len() == 4) & ((word == u32::from_le_bytes(*b"view")) | (word == u32::from_le_bytes(*b"cart")));
         raw.pc = match f[4] {
-            b"view" | b"cart" => 0,
+            _ if view_or_cart => 0,
             b"purchase" => {
                 let price = match ts::digits(f[6]) {
                     Some(p) if (1..=10_000_000).contains(&p) => p as u32,
@@ -546,11 +548,11 @@ fn campaign_number(id: &[u8]) -> Option<usize> {
 }
 
 #[inline(always)]
-fn parse_click(f: &[&[u8]; 4], lk: &Lookups, out: &mut Bucket<Click>, slab: &mut Slab) {
+fn parse_click(f: &[&[u8]; 4], lk: &Lookups, dates: &mut ts::DateCache, out: &mut Bucket<Click>, slab: &mut Slab) {
     if f[0].is_empty() || f[1].is_empty() || f[2].is_empty() {
         return;
     }
-    let Some(ts) = lk.time.parse(f[3]) else { return };
+    let Some(ts) = ts::parse_cached(f[3], dates) else { return };
     if ts < lk.base || ts >= lk.window_end {
         return;
     }
@@ -1278,6 +1280,7 @@ fn write_tables(out: &Path, outputs: &[Output], counts: &[Counts], lk: &Lookups,
 }
 
 struct Parsed {
+    dates: ts::DateCache,
     raw: Vec<Bucket<Raw>>,
     clicks: Bucket<Click>,
     slab: Slab,
@@ -1325,7 +1328,7 @@ fn main() {
     let parsed = run(
         threads,
         nl + ne + click_chunks.len(),
-        || Parsed { raw: (0..BUCKETS).map(|_| Bucket::new()).collect(), clicks: Bucket::new(), slab: Slab::new() },
+        || Parsed { dates: ts::DateCache::new(), raw: (0..BUCKETS).map(|_| Bucket::new()).collect(), clicks: Bucket::new(), slab: Slab::new() },
         |st, t| {
             if t < nl {
                 let (data, s, e) = link_chunks[t];
@@ -1344,11 +1347,11 @@ fn main() {
                 }
             } else if t < nl + ne {
                 let (data, s, e) = event_chunks[t - nl];
-                csv::rows::<7>(data, s, e, |f| parse_event(f, &lk, &mut st.raw, &mut st.slab));
+                csv::rows::<7>(data, s, e, |f| parse_event(f, &lk, &mut st.dates, &mut st.raw, &mut st.slab));
                 csv::release(data, s, e);
             } else {
                 let (data, s, e) = click_chunks[t - nl - ne];
-                csv::rows::<4>(data, s, e, |f| parse_click(f, &lk, &mut st.clicks, &mut st.slab));
+                csv::rows::<4>(data, s, e, |f| parse_click(f, &lk, &mut st.dates, &mut st.clicks, &mut st.slab));
                 csv::release(data, s, e);
             }
         },
