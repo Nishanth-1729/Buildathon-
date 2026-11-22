@@ -347,7 +347,7 @@ fn rows_small<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut 
                     }
                 }
             } else {
-                (ok, next, out) = slow_row(data, at);
+                (ok, next, out) = longer_row(data, at);
             }
         } else {
             (ok, next, out) = slow_row(data, at);
@@ -486,7 +486,7 @@ fn rows7<'a>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [
             }
         }
         if !ok {
-            (ok, next, out) = slow_row(data, at);
+            (ok, next, out) = longer_row(data, at);
         }
         // One call site, so the closure is inlined and the fields stay in registers.
         if ok {
@@ -494,6 +494,65 @@ fn rows7<'a>(data: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [
         }
         at = next;
     }
+}
+
+/// A row of up to 127 bytes, from 128 bytes at `at` (which must be inside
+/// `data`); None when the row is longer, for the scalar path.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn medium_row<'a, const N: usize>(data: &'a [u8], at: usize) -> Option<(bool, usize, [&'a [u8]; N])> {
+    use std::arch::x86_64::*;
+    // Safety: the caller ensures at + 128 <= data.len().
+    let (commas, newlines, quotes) = unsafe {
+        let p = data.as_ptr().add(at);
+        let v = [0, 32, 64, 96].map(|o| _mm256_loadu_si256(p.add(o).cast()));
+        let mask = |byte| {
+            let byte = _mm256_set1_epi8(byte);
+            v.iter().enumerate().fold(0u128, |m, (i, &x)| {
+                m | (_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, byte)) as u32 as u128) << (32 * i)
+            })
+        };
+        (mask(b',' as i8), mask(b'\n' as i8), mask(b'"' as i8))
+    };
+    if newlines == 0 {
+        return None;
+    }
+    let len = newlines.trailing_zeros() as usize;
+    let below = (1u128 << len) - 1;
+    let mut c = commas & below;
+    let mut out: [&'a [u8]; N] = [&[]; N];
+    if len == 0 || c.count_ones() as usize != N - 1 {
+        return Some((false, at + len + 1, out));
+    }
+    let row = &data[at..at + len + 1];
+    let mut s = 0usize;
+    let mut paired = 0u32;
+    for (i, dst) in out.iter_mut().enumerate() {
+        let e = if i == N - 1 { len } else { c.trailing_zeros() as usize };
+        c &= c.wrapping_sub(1);
+        let size = e - s;
+        let (left, right) = (row[s], row[e.saturating_sub(1)]);
+        let q = (size >= 2) & (left == b'"') & (right == b'"');
+        let t = q as usize;
+        *dst = &row[s + t..e - t];
+        paired += 2 * q as u32;
+        s = e + 1;
+    }
+    // Every quote must be one of the pairs around a whole field.
+    Some((paired == (quotes & below).count_ones(), at + len + 1, out))
+}
+
+/// A row the 64-byte windows could not take: 128 bytes at once when they
+/// are inside `data`, else the scalar path.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn longer_row<'a, const N: usize>(data: &'a [u8], at: usize) -> (bool, usize, [&'a [u8]; N]) {
+    if at + 128 <= data.len() {
+        if let Some(r) = medium_row(data, at) {
+            return r;
+        }
+    }
+    slow_row(data, at)
 }
 
 /// The row at `at` by the scalar `fields`: (well formed, start of the next

@@ -184,7 +184,14 @@ fn lookup_rows(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 /// None when the dataset is outside this layout's limits.
 fn lookups(data: &Path) -> Option<Lookups> {
-    let ids = Interner::new();
+    // About one long ID per 400 input bytes at most, for the generator's mix.
+    let input: u64 = ["links", "events", "clicks"]
+        .iter()
+        .flat_map(|d| csv::list(&data.join(d)))
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let ids = Interner::with_capacity((input / 400) as usize);
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let window_start = manifest_time(&manifest, "window_start");
     let window_end = manifest_time(&manifest, "window_end");
@@ -484,6 +491,48 @@ impl<T: Copy> Batch<T> {
             let i = self.done % WINDOW;
             sink(names.resolve(self.keys[i], self.at[i]), self.items[i]);
             self.done += 1;
+        }
+    }
+}
+
+/// Rows with a long ID wait here for a few rows while the ID table slots
+/// they need are loaded; other rows go straight through.
+struct Waiting<'a, const N: usize> {
+    rows: [[&'a [u8]; N]; WAIT],
+    n: usize,
+}
+
+const WAIT: usize = 8;
+
+impl<'a, const N: usize> Waiting<'a, N> {
+    fn new() -> Self {
+        Waiting { rows: [[&[]; N]; WAIT], n: 0 }
+    }
+
+    /// The row to parse now, if any: `f` itself, or a row that has waited.
+    #[inline(always)]
+    fn pass(&mut self, ids: &Interner, f: &[&'a [u8]; N], id_fields: [usize; 2]) -> Option<[&'a [u8]; N]> {
+        let [a, b] = id_fields.map(|i| f[i]);
+        let (long_a, long_b) = (Interner::is_long(a), Interner::is_long(b));
+        if !(long_a | long_b) {
+            return Some(*f);
+        }
+        if long_a {
+            ids.prefetch(a);
+        }
+        if long_b {
+            ids.prefetch(b);
+        }
+        let slot = &mut self.rows[self.n % WAIT];
+        let out = if self.n >= WAIT { Some(*slot) } else { None };
+        *slot = *f;
+        self.n += 1;
+        out
+    }
+
+    fn drain(&self, mut f: impl FnMut(&[&'a [u8]; N])) {
+        for i in self.n.saturating_sub(WAIT)..self.n {
+            f(&self.rows[i % WAIT]);
         }
     }
 }
@@ -1331,7 +1380,12 @@ fn main() {
     let parsed = run(
         threads,
         nl + ne + click_chunks.len(),
-        || Parsed { dates: ts::DateCache::new(), raw: (0..BUCKETS).map(|_| Bucket::new()).collect(), clicks: Bucket::new(), slab: Slab::new() },
+        || Parsed {
+            dates: ts::DateCache::new(),
+            raw: (0..BUCKETS).map(|_| Bucket::new()).collect(),
+            clicks: Bucket::new(),
+            slab: Slab::new(),
+        },
         |st, t| {
             if t < nl {
                 let (data, s, e) = link_chunks[t];
@@ -1350,11 +1404,25 @@ fn main() {
                 }
             } else if t < nl + ne {
                 let (data, s, e) = event_chunks[t - nl];
-                csv::rows::<7>(data, s, e, |f| parse_event(f, &lk, &mut st.dates, &mut st.raw, &mut st.slab));
+                let Parsed { dates, raw, slab, .. } = st;
+                let mut waiting = Waiting::<7>::new();
+                csv::rows::<7>(data, s, e, |f| {
+                    if let Some(f) = waiting.pass(&lk.ids, f, [0, 1]) {
+                        parse_event(&f, &lk, dates, raw, slab);
+                    }
+                });
+                waiting.drain(|f| parse_event(f, &lk, dates, raw, slab));
                 csv::release(data, s, e);
             } else {
                 let (data, s, e) = click_chunks[t - nl - ne];
-                csv::rows::<4>(data, s, e, |f| parse_click(f, &lk, &mut st.dates, &mut st.clicks, &mut st.slab));
+                let Parsed { dates, clicks, slab, .. } = st;
+                let mut waiting = Waiting::<4>::new();
+                csv::rows::<4>(data, s, e, |f| {
+                    if let Some(f) = waiting.pass(&lk.ids, f, [0, 1]) {
+                        parse_click(&f, &lk, dates, clicks, slab);
+                    }
+                });
+                waiting.drain(|f| parse_click(f, &lk, dates, clicks, slab));
                 csv::release(data, s, e);
             }
         },
