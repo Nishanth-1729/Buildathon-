@@ -333,6 +333,16 @@ impl Names {
     }
 
     #[inline(always)]
+    fn prefetch_filter(&self, k: Key) {
+        #[cfg(target_arch = "x86_64")]
+        // The word index is masked to the filter's size.
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.filter.as_ptr().add(self.filter_bit(k).0).cast::<i8>(), _MM_HINT_T0);
+        }
+    }
+
+    #[inline(always)]
     fn prefetch(&self, at: u32) {
         #[cfg(target_arch = "x86_64")]
         // `at` came from `locate`: its slot index is below the table size.
@@ -461,12 +471,16 @@ struct Batch<T: Copy> {
     at: [u32; WINDOW],
     items: [T; WINDOW],
     pushed: usize,
+    /// Keys below this have their slot located and on its way.
+    located: usize,
     done: usize,
 }
 
+/// A key's filter word is fetched when it is pushed, its slot `WINDOW / 2`
+/// pushes later, and it is resolved `WINDOW` pushes after it came.
 impl<T: Copy> Batch<T> {
     fn new(fill: T) -> Self {
-        Batch { keys: [0; WINDOW], at: [0; WINDOW], items: [fill; WINDOW], pushed: 0, done: 0 }
+        Batch { keys: [0; WINDOW], at: [0; WINDOW], items: [fill; WINDOW], pushed: 0, located: 0, done: 0 }
     }
 
     #[inline(always)]
@@ -476,17 +490,27 @@ impl<T: Copy> Batch<T> {
             sink(names.resolve(self.keys[i], self.at[i]), self.items[i]);
             self.done += 1;
         }
-        let at = names.locate(k);
-        names.prefetch(at);
+        if self.pushed - self.located == WINDOW / 2 {
+            let i = self.located % WINDOW;
+            let at = names.locate(self.keys[i]);
+            names.prefetch(at);
+            self.at[i] = at;
+            self.located += 1;
+        }
+        names.prefetch_filter(k);
         let i = self.pushed % WINDOW;
         self.keys[i] = k;
-        self.at[i] = at;
         self.items[i] = item;
         self.pushed += 1;
     }
 
     #[inline(always)]
     fn flush(&mut self, names: &Names, sink: &mut impl FnMut(Key, T)) {
+        while self.located < self.pushed {
+            let i = self.located % WINDOW;
+            self.at[i] = names.locate(self.keys[i]);
+            self.located += 1;
+        }
         while self.done < self.pushed {
             let i = self.done % WINDOW;
             sink(names.resolve(self.keys[i], self.at[i]), self.items[i]);
