@@ -546,7 +546,7 @@ fn parse_event(f: &[&[u8]; 7], lk: &Lookups, dates: &mut ts::DateCache, out: &mu
         Some((time, ingest)) => (Some(time), ingest),
         None => (ts::parse_cached(f[2], dates), ts::parse_cached(f[3], dates).unwrap_or(i64::MAX)),
     };
-    let mut raw = Raw { eid: lk.ids.key(f[0]), uid: 0, ingest, ts: INVALID, pc: 0 };
+    let mut raw = Raw { eid: lk.ids.key_hashed(f[0]), uid: 0, ingest, ts: INVALID, pc: 0 };
     'valid: {
         if f[1].is_empty() || f[5].is_empty() {
             break 'valid;
@@ -1407,7 +1407,7 @@ fn main() {
                 let Parsed { dates, raw, slab, .. } = st;
                 let mut waiting = Waiting::<7>::new();
                 csv::rows::<7>(data, s, e, |f| {
-                    if let Some(f) = waiting.pass(&lk.ids, f, [0, 1]) {
+                    if let Some(f) = waiting.pass(&lk.ids, f, [1, 1]) {
                         parse_event(&f, &lk, dates, raw, slab);
                     }
                 });

@@ -158,6 +158,20 @@ impl Interner {
         self.intern(s)
     }
 
+    /// The key of an ID that is only compared for equality (an event ID): the
+    /// packed key when it packs, else a 63-bit hash with the top bit set, so
+    /// no table is touched. Never use it with `bytes` or `cmp`. Two different
+    /// long IDs share a key with probability about n^2 / 2^64: under 1e-6
+    /// for the 3M distinct long IDs of a 60M-event run.
+    #[inline(always)]
+    pub fn key_hashed(&self, s: &[u8]) -> Key {
+        if Self::is_long(s) {
+            INTERNED | (hash_bytes(s) & !INTERNED)
+        } else {
+            self.key(s)
+        }
+    }
+
     /// True for an ID that `key` looks up in the table: a long one.
     #[inline(always)]
     pub fn is_long(s: &[u8]) -> bool {
@@ -413,5 +427,25 @@ mod intern_tests {
         }
         let (a, b) = (ids.key(&make(1)), ids.key(&make(2)));
         assert_eq!(ids.cmp(a, b), make(1).cmp(&make(2)));
+    }
+}
+
+#[cfg(test)]
+mod hashed_tests {
+    use super::Interner;
+
+    #[test]
+    fn hashed_event_ids() {
+        let ids = Interner::new();
+        for s in [&b"u12345678"[..], b"abc", b"e6d3t175y", b""] {
+            assert_eq!(ids.key_hashed(s), ids.key(s));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..200_000u64 {
+            let s = format!("e{:032x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as u128 * 0x1_0000_0001);
+            let key = ids.key_hashed(s.as_bytes());
+            assert_eq!(key, ids.key_hashed(s.as_bytes()));
+            assert!(seen.insert(key), "collision at {i}");
+        }
     }
 }

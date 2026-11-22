@@ -542,6 +542,78 @@ fn medium_row<'a, const N: usize>(data: &'a [u8], at: usize) -> Option<(bool, us
     Some((paired == (quotes & below).count_ones(), at + len + 1, out))
 }
 
+/// A row of up to 255 bytes with `N` fields, from four 64-byte mask windows:
+/// the middle tier between the one- and two-window paths (rows of at most 63
+/// or about 120 bytes) and the byte-by-byte `slow_row`, for rows that carry
+/// a long ID. Returns the start of the next row and the fields, or None when
+/// the row is longer, or is not well formed in any way (the caller then asks
+/// `slow_row`, which decides).
+///
+/// Safety: `at + 256 <= data.len()`.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(never)]
+unsafe fn wide_row<'a, const N: usize>(data: &'a [u8], at: usize) -> Option<(usize, [&'a [u8]; N])> {
+    let base = data.as_ptr().add(at);
+    let (mut commas, mut newlines, mut quotes) = ([0u64; 4], [0u64; 4], [0u64; 4]);
+    for w in 0..4 {
+        (commas[w], newlines[w], quotes[w]) = masks64(base.add(64 * w));
+    }
+    let len = (0..4).find(|&w| newlines[w] != 0).map(|w| 64 * w + newlines[w].trailing_zeros() as usize)?;
+    if len == 0 {
+        return None;
+    }
+    // The bits of window `w` that lie below the newline.
+    let below = |w: usize| -> u64 {
+        let lo = 64 * w;
+        if len <= lo {
+            0
+        } else if len - lo >= 64 {
+            !0
+        } else {
+            (1u64 << (len - lo)) - 1
+        }
+    };
+    let mut pos = [0usize; N];
+    let mut k = 0;
+    for w in 0..4 {
+        let mut m = commas[w] & below(w);
+        while m != 0 {
+            if k == N - 1 {
+                return None;
+            }
+            pos[k] = 64 * w + m.trailing_zeros() as usize;
+            k += 1;
+            m &= m - 1;
+        }
+    }
+    if k != N - 1 {
+        return None;
+    }
+    pos[N - 1] = len;
+    let mut quote_bytes = 0u32;
+    for w in 0..4 {
+        quote_bytes += (quotes[w] & below(w)).count_ones();
+    }
+    let mut out: [&'a [u8]; N] = [&[]; N];
+    let (mut start, mut paired) = (0usize, 0u32);
+    for i in 0..N {
+        let end = pos[i];
+        let (mut a, mut b) = (start, end);
+        if end - start >= 2 && *base.add(start) == b'"' && *base.add(end - 1) == b'"' {
+            a += 1;
+            b -= 1;
+            paired += 2;
+        }
+        out[i] = std::slice::from_raw_parts(base.add(a), b - a);
+        start = end + 1;
+    }
+    // Every quote must be one of the pairs around a whole field.
+    if paired != quote_bytes {
+        return None;
+    }
+    Some((at + len + 1, out))
+}
+
 /// A row the 64-byte windows could not take: 128 bytes at once when they
 /// are inside `data`, else the scalar path.
 #[cfg(target_feature = "avx2")]
@@ -550,6 +622,13 @@ fn longer_row<'a, const N: usize>(data: &'a [u8], at: usize) -> (bool, usize, [&
     if at + 128 <= data.len() {
         if let Some(r) = medium_row(data, at) {
             return r;
+        }
+    }
+    #[cfg(target_feature = "bmi2")]
+    if at + 256 <= data.len() {
+        // Safety: at + 256 <= data.len().
+        if let Some((next, out)) = unsafe { wide_row::<N>(data, at) } {
+            return (true, next, out);
         }
     }
     slow_row(data, at)
