@@ -679,6 +679,8 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
     drop((event_chunks, click_chunks));
     drop(event_files);
     lap(&format!("parse: {} IDs", people.len()));
+    // EXPERIMENT (phase timing probe, not for the final): sleep 100 x the elapsed seconds here.
+    std::thread::sleep(std::time::Duration::from_micros((clock.elapsed().as_secs_f64() * 100_000_000.0) as u64));
 
     // 3. Duplicates.
     let finders = run(threads, nq, Finder::default, |fd, b| {
