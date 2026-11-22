@@ -703,6 +703,8 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
     });
     drop(finders);
     lap("duplicates");
+    // EXPERIMENT (phase timing probe, not for the final): sleep 100 x the elapsed seconds here.
+    std::thread::sleep(std::time::Duration::from_micros((clock.elapsed().as_secs_f64() * 100_000_000.0) as u64));
 
     // 4. Sessions per person partition, the largest first.
     let sizes: Vec<usize> = (0..np).map(|p| shards.iter().map(|s| s.ev[p].len()).sum()).collect();
