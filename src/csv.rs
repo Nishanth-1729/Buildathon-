@@ -742,6 +742,195 @@ pub fn rows<'a, const N: usize>(data: &'a [u8], start: usize, end: usize, mut f:
     }
 }
 
+// ---- pread input -----------------------------------------------------------
+
+extern "C" {
+    fn pread(fd: i32, buf: *mut u8, count: usize, offset: i64) -> isize;
+}
+const MADV_HUGEPAGE: i32 = 14;
+const PROT_READ_WRITE: i32 = 3;
+const MAP_PRIVATE_ANONYMOUS: i32 = 0x2 | 0x20;
+const HUGE: usize = 2 << 20;
+
+/// An input file read with `pread` into a `ChunkBuf`. Shared by the threads.
+/// Its handle stays open for the whole run unless there are so many files that
+/// they could exhaust the descriptors; then every chunk opens it for itself.
+pub struct Input {
+    path: std::path::PathBuf,
+    file: Option<File>,
+    len: usize,
+}
+
+/// Up to this many files keep their handles open.
+const KEEP_OPEN: usize = 64;
+
+impl Input {
+    /// Every `*.csv` in `dir`, opened.
+    pub fn open_all(dir: &Path) -> Vec<Input> {
+        let paths = list(dir);
+        let keep = paths.len() <= KEEP_OPEN;
+        paths
+            .into_iter()
+            .map(|path| {
+                let file = File::open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                let len = file.metadata().unwrap().len() as usize;
+                Input { path, file: keep.then_some(file), len }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn open(path: &Path) -> Self {
+        let file = File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let len = file.metadata().unwrap().len() as usize;
+        Input { path: path.to_path_buf(), file: Some(file), len }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Reads `buf[at..at + n]` from the file offset `off`; the range lies inside the file.
+    fn read_into(file: &File, buf: &mut ChunkBuf, at: usize, n: usize, off: usize) {
+        let mut done = 0;
+        while done < n {
+            // Safety: buf.ptr[at..at + n] is inside the buffer (the caller reserved it).
+            let r = unsafe { pread(file.as_raw_fd(), buf.ptr.add(at + done), n - done, (off + done) as i64) };
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("pread: {e}");
+            }
+            assert!(r > 0, "pread: the input file got shorter");
+            done += r as usize;
+        }
+    }
+}
+
+/// How far past the end of a chunk the first read goes: far enough for the end
+/// of the last row that starts in the chunk, in any valid data (rows are
+/// under 300 bytes) and so that the scanners' wide loads take their fast paths.
+const TAIL: usize = 1024;
+/// A row longer than this restarts the run on the general pipeline.
+const MAX_ROW: usize = 64 << 20;
+
+/// A per-thread buffer that holds one chunk of a file and the bytes after it,
+/// reused for every chunk (anonymous memory that asks for huge pages).
+pub struct ChunkBuf {
+    base: *mut u8,
+    map_len: usize,
+    ptr: *mut u8,
+    cap: usize,
+    tail: usize,
+}
+
+// Owned memory, used by one thread at a time.
+unsafe impl Send for ChunkBuf {}
+
+impl ChunkBuf {
+    /// A buffer for chunks of up to `chunk` bytes.
+    pub fn new(chunk: usize) -> Self {
+        Self::with_tail(chunk, TAIL)
+    }
+
+    /// `new` with another first-read tail (the tests make it small).
+    pub fn with_tail(chunk: usize, tail: usize) -> Self {
+        let mut b = ChunkBuf { base: std::ptr::null_mut(), map_len: 0, ptr: std::ptr::null_mut(), cap: 0, tail };
+        b.reserve(chunk + tail + 1, 0);
+        b
+    }
+
+    /// The first `n` bytes of the buffer, which are initialized.
+    fn view(&self, n: usize) -> &[u8] {
+        debug_assert!(n <= self.cap);
+        // Safety: the callers have written them.
+        unsafe { std::slice::from_raw_parts(self.ptr, n) }
+    }
+
+    /// Makes room for `need` bytes, keeping the first `used`.
+    fn reserve(&mut self, need: usize, used: usize) {
+        if need <= self.cap {
+            return;
+        }
+        let huge = need >= HUGE;
+        let cap = if huge { need.div_ceil(HUGE) * HUGE } else { need.div_ceil(4096) * 4096 };
+        let map_len = cap + if huge { HUGE } else { 0 };
+        // Safety: a fresh anonymous mapping, owned by self; the data is copied before the old one goes.
+        unsafe {
+            let p = mmap(std::ptr::null_mut(), map_len, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, -1, 0);
+            assert!(p as isize != -1, "mmap read buffer");
+            let ptr = if huge { ((p as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8 } else { p };
+            if huge {
+                madvise(ptr, cap, MADV_HUGEPAGE);
+            }
+            if used != 0 {
+                std::ptr::copy_nonoverlapping(self.ptr, ptr, used);
+            }
+            if !self.base.is_null() {
+                munmap(self.base, self.map_len);
+            }
+            (self.base, self.map_len, self.ptr, self.cap) = (p, map_len, ptr, cap);
+        }
+    }
+
+    /// The bytes of the chunk `[start, end)` of `file`, and the bytes after it
+    /// up to the end of the last row that starts in it, as `(data, start, end)`:
+    /// `data` holds the file from `start - 1` (from 0 for the first chunk) and
+    /// `start`, `end` are the chunk's offsets in it. `rows(data, start, end, ..)`
+    /// then yields what `rows(whole file, start, end, ..)` would.
+    ///
+    /// The scanners take the row that follows the first newline at or after
+    /// `start - 1`, up to the rows that start before `end`, each through its
+    /// newline or the end of the file. So `data` is cut after the first newline
+    /// at or after `end - 1`; and when there is no newline before `end - 1`
+    /// (nothing is taken), anywhere. Only a data row longer than `TAIL` costs more reads.
+    pub fn load<'a>(&'a mut self, file: &Input, start: usize, end: usize) -> (&'a [u8], usize, usize) {
+        debug_assert!(start < end && end <= file.len);
+        let reopened;
+        let handle = match &file.file {
+            Some(f) => f,
+            None => {
+                reopened = File::open(&file.path).unwrap_or_else(|e| panic!("{}: {e}", file.path.display()));
+                &reopened
+            }
+        };
+        let lo = start.saturating_sub(1);
+        let mut hi = (end + self.tail).min(file.len);
+        self.reserve(hi - lo, 0);
+        Input::read_into(handle, self, 0, hi - lo, lo);
+        // A newline before `end - 1`: a row will be taken.
+        let rel_end = end - lo;
+        if self.view(hi - lo)[..rel_end - 1].contains(&b'\n') {
+            // Its last row ends at the first newline at or after `end - 1`.
+            let mut from = rel_end - 1;
+            loop {
+                if self.view(hi - lo)[from..].contains(&b'\n') || hi == file.len {
+                    break;
+                }
+                from = hi - lo;
+                let more = (hi - lo).max(1 << 16).min(file.len - hi);
+                if hi - lo + more > MAX_ROW {
+                    super::fast::fallback("a row of more than 64 MB");
+                }
+                self.reserve(hi - lo + more, hi - lo);
+                Input::read_into(handle, self, hi - lo, more, hi);
+                hi += more;
+            }
+        }
+        (self.view(hi - lo), start - lo, rel_end)
+    }
+}
+
+impl Drop for ChunkBuf {
+    fn drop(&mut self) {
+        if !self.base.is_null() {
+            unsafe { munmap(self.base, self.map_len) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,5 +1144,90 @@ mod tests {
             }
             assert_eq!(seen, vec![b"l1".to_vec(), b"".to_vec(), b"l3".to_vec(), b"l4".to_vec()], "{size}");
         }
+    }
+
+    /// Scanning a file chunk by chunk through `ChunkBuf::load` (pread) gives the
+    /// rows that scanning the whole file does, for every chunk size and tail.
+    #[test]
+    fn pread_chunks_match_whole_file() {
+        let mut state = 0x7F4A_7C15_9E37_79B9u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let dir = std::env::temp_dir().join(format!("pread-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.csv");
+        for round in 0..3000 {
+            let mut data: Vec<u8> = Vec::new();
+            match round % 4 {
+                0 => {
+                    // Random bytes of a small alphabet.
+                    const A: &[u8] = b"ab,,,\"\n\n\r x";
+                    const B: &[u8] = b"abcdefghijklmnopqrstuvwxyz,,\"\n";
+                    let alphabet = if round % 8 == 0 { A } else { B };
+                    let len = (next() % 1500) as usize;
+                    data.extend((0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]));
+                }
+                _ => {
+                    // Rows of random fields, some very long, a header, maybe no final newline.
+                    if next() % 8 != 0 {
+                        data.extend_from_slice(b"h1,h2,h3\n");
+                    }
+                    for _ in 0..next() % 30 {
+                        let n = [7, 7, 4, 2, 3, 1, 8][(next() % 7) as usize];
+                        for i in 0..n {
+                            let len = match next() % 16 {
+                                0 => next() % 900,
+                                1 | 2 => next() % 70,
+                                3 => 0,
+                                _ => [1, 5, 8, 10, 13, 20][(next() % 6) as usize],
+                            };
+                            let quoted = next() % 8 == 0;
+                            if quoted {
+                                data.push(b'"');
+                            }
+                            data.extend((0..len).map(|_| b"abcz019 _-:T"[(next() % 12) as usize]));
+                            if quoted {
+                                data.push(b'"');
+                            }
+                            if i + 1 < n {
+                                data.push(b',');
+                            }
+                        }
+                        if next() % 30 != 0 {
+                            data.push(b'\n');
+                        }
+                    }
+                }
+            }
+            std::fs::write(&path, &data).unwrap();
+            let mut input = Input::open(&path);
+            if round % 2 == 1 {
+                input.file = None;
+            }
+            assert_eq!(input.len(), data.len());
+            let size = [1, 7, 64, 97, 128, 129, 300, 1000, 1 << 20][(next() % 9) as usize];
+            let tail = [0, 1, 17, 127, 300, 1024][(next() % 6) as usize];
+            let mut buf = ChunkBuf::with_tail(size.min(64), tail);
+            macro_rules! check {
+                ($n:literal) => {{
+                    let (mut want, mut got) = (Vec::new(), Vec::new());
+                    for (s, e) in chunks(data.len(), size) {
+                        rows::<$n>(&data, s, e, |f| want.push(f.map(<[u8]>::to_vec)));
+                        let (d, s2, e2) = buf.load(&input, s, e);
+                        rows::<$n>(d, s2, e2, |f| got.push(f.map(<[u8]>::to_vec)));
+                    }
+                    assert_eq!(want, got, "round {round} n {} size {size} tail {tail}: {:?}", $n, String::from_utf8_lossy(&data));
+                }};
+            }
+            check!(2);
+            check!(3);
+            check!(4);
+            check!(7);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

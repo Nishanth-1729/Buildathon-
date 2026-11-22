@@ -28,6 +28,10 @@ use crate::people::{IdRef, People};
 /// Link chunks are small: the links are a few percent of the input and the
 /// work on them is cache misses, so every thread should get a share.
 const LINK_CHUNK: usize = 256 << 10;
+/// Event and click chunks, read into a buffer of that size per thread: small
+/// enough that the bytes pread just copied are still in the core caches when
+/// they are scanned (4 MB chunks, as the mapped input had, measured 8% slower).
+const READ_CHUNK: usize = 512 << 10;
 /// `ERec::person` of a copy that dedup found to be later than another.
 const DROPPED: u32 = u32::MAX;
 /// Lookups in flight per thread while events and clicks wait for their slots.
@@ -284,23 +288,26 @@ fn parse_click(f: &[&[u8]; 4], cx: &Cx, st: &mut Shard) {
         },
     };
     let id = cx.people.locate(f[1]);
-    st.push::<false>(cx, Pend { a: click_key(f[0]), id, ts: (ts - lk.base) as u32, x: campaign, ingest: 0 });
+    st.push::<false>(cx, Pend { a: click_key(&lk.ids, f[0]), id, ts: (ts - lk.base) as u32, x: campaign, ingest: 0 });
 }
 
-/// The key of a click ID: its packed key when it packs, else a pointer to its
-/// bytes in the (still mapped) click file: INTERNED, the length in bits 48..56
-/// and the address below. Two copies of one click then have different keys, so
+/// The key of a click ID: its packed key when it packs, else a pointer to a
+/// copy of its bytes in the interner's arena: INTERNED, the length in bits
+/// 48..56 and the address below. (A pointer into the click file would fault in
+/// the whole file, 64 KB around every long ID that is compared, and its pages
+/// would have to be freed at the exit.) Two copies of one click then have different keys, so
 /// `click_id_eq` and `click_id_cmp` compare such keys by their bytes; that is
 /// only needed for clicks of one person at one timestamp.
 #[inline(always)]
-fn click_key(s: &[u8]) -> Key {
+fn click_key(ids: &Interner, s: &[u8]) -> Key {
     match Interner::pack_short(s) {
         Some(k) => k,
         None => {
             if s.len() > 255 {
                 fallback("a click ID of more than 255 bytes");
             }
-            INTERNED | (s.len() as u64) << 48 | s.as_ptr() as u64
+            // The record is a u32 length, then the bytes.
+            INTERNED | (s.len() as u64) << 48 | (ids.copy(s) + 4) as u64
         }
     }
 }
@@ -312,7 +319,7 @@ fn with_click_bytes<R>(ids: &Interner, k: Key, f: impl FnOnce(&[u8]) -> R) -> R 
         ids.bytes(k, &mut v);
         f(&v)
     } else {
-        // Safety: made by `click_key` from bytes of a click file that stays mapped.
+        // Safety: made by `click_key` from bytes copied into the arena, which is never freed.
         f(unsafe { std::slice::from_raw_parts((k & key::ADDRESS) as *const u8, (k >> 48 & 255) as usize) })
     }
 }
@@ -353,7 +360,7 @@ struct Links {
     ins: usize,
 }
 
-// The IdRefs point into mapped input that outlives every chunk task.
+// The IdRefs point into a read buffer, but none outlives its chunk: `drain` ends every chunk.
 unsafe impl Send for Links {}
 
 impl Links {
@@ -398,13 +405,17 @@ impl Links {
     }
 }
 
-/// Every chunk of the mapped CSVs, `size` bytes each: (file contents, start, end).
-fn chunks_sized(mappings: &[csv::Mapping], size: usize) -> Vec<(&[u8], usize, usize)> {
+/// The CSV files in `dir`, opened for `pread`.
+fn input_files(dir: &Path) -> Vec<csv::Input> {
+    csv::Input::open_all(dir)
+}
+
+/// Every chunk of the files, `size` bytes each: (file number, start, end).
+fn chunks_sized(files: &[csv::Input], size: usize) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
-    for mapping in mappings {
-        let data = mapping.bytes();
-        for (s, e) in csv::chunks(data.len(), size) {
-            out.push((data, s, e));
+    for (i, file) in files.iter().enumerate() {
+        for (s, e) in csv::chunks(file.len(), size) {
+            out.push((i, s, e));
         }
     }
     out
@@ -632,17 +643,17 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
     run(threads, people.pieces(), || (), |_, i| people.populate_piece(i));
 
     // 1. Links.
-    let link_files = mapped_csvs(&data.join("links"));
+    let link_files = input_files(&data.join("links"));
     let link_chunks = chunks_sized(&link_files, LINK_CHUNK);
-    run(threads, link_chunks.len(), Links::new, |st, t| {
-        let (data, s, e) = link_chunks[t];
+    run(threads, link_chunks.len(), || (Links::new(), csv::ChunkBuf::new(LINK_CHUNK)), |(st, buf), t| {
+        let (file, s, e) = link_chunks[t];
+        let (data, s, e) = buf.load(&link_files[file], s, e);
         csv::rows::<2>(data, s, e, |f| {
             if !f[0].is_empty() && !f[1].is_empty() {
                 st.step(&cx, Some((people.locate(f[0]), people.locate(f[1]))));
             }
         });
         st.drain(&cx);
-        csv::release(data, s, e);
     });
     drop(link_chunks);
     drop(link_files);
@@ -651,33 +662,34 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
     lap(&format!("links: {} IDs in 2^{bits} slots", people.len()));
 
     // 2. Events and clicks.
-    let event_files = mapped_csvs(&data.join("events"));
-    let click_files = mapped_csvs(&data.join("clicks"));
-    let chunk = env_num("SESS_CHUNK").unwrap_or(CHUNK);
+    let event_files = input_files(&data.join("events"));
+    let click_files = input_files(&data.join("clicks"));
+    let chunk = env_num("SESS_CHUNK").unwrap_or(READ_CHUNK);
     let event_chunks = chunks_sized(&event_files, chunk);
     let click_chunks = chunks_sized(&click_files, chunk);
     let ne = event_chunks.len();
     let shards = run(
         threads,
         ne + click_chunks.len(),
-        || Shard::new(np, nq),
-        |st, t| {
+        || (Shard::new(np, nq), csv::ChunkBuf::new(chunk)),
+        |(st, buf), t| {
             if t < ne {
-                let (data, s, e) = event_chunks[t];
+                let (file, s, e) = event_chunks[t];
+                let (data, s, e) = buf.load(&event_files[file], s, e);
                 csv::rows::<7>(data, s, e, |f| parse_event(f, &cx, st));
                 st.drain::<true>(&cx);
-                csv::release(data, s, e);
             } else {
-                let (data, s, e) = click_chunks[t - ne];
+                let (file, s, e) = click_chunks[t - ne];
+                let (data, s, e) = buf.load(&click_files[file], s, e);
                 csv::rows::<4>(data, s, e, |f| parse_click(f, &cx, st));
                 st.drain::<false>(&cx);
-                csv::release(data, s, e);
             }
         },
     );
-    // The click files stay mapped: long click IDs point into them.
+    let shards: Vec<Shard> = shards.into_iter().map(|(shard, _buf)| shard).collect();
     drop((event_chunks, click_chunks));
     drop(event_files);
+    drop(click_files);
     lap(&format!("parse: {} IDs", people.len()));
 
     // 3. Duplicates.
@@ -789,7 +801,7 @@ mod tests {
             long_a.clone(), long_a.clone(), long_b, vec![0xff, b'z'], vec![b'x', 0, b'y'], b"000000017".to_vec(),
             b"0000000170".to_vec(),
         ];
-        let keys: Vec<Key> = samples.iter().map(|s| click_key(s)).collect();
+        let keys: Vec<Key> = samples.iter().map(|s| click_key(&ids, s)).collect();
         let item = |key: Key, ts: u32| (ts as u128) << 96 | (key as u128) << 32;
         for (i, (a, ka)) in samples.iter().zip(&keys).enumerate() {
             for (j, (b, kb)) in samples.iter().zip(&keys).enumerate() {
