@@ -175,7 +175,17 @@ fn lookup_rows(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn lookups(data: &Path) -> Lookups {
-    let ids = Interner::new();
+    // A distinct long ID takes at least 34 bytes of input, so a table for
+    // input / 40 IDs never counts as crowded. A crowded table sends new IDs to
+    // a locked map while other threads may still add the same ID to the table:
+    // one ID, two keys, and wrong people at high thread counts.
+    let input: u64 = ["links", "events", "clicks"]
+        .iter()
+        .flat_map(|d| csv::list(&data.join(d)))
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let ids = Interner::with_capacity((input / 40).min(1 << 28) as usize);
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let window_start = manifest_time(&manifest, "window_start");
     let window_end = manifest_time(&manifest, "window_end");

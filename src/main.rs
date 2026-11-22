@@ -16,9 +16,11 @@
 
 mod chunks;
 mod csv;
+mod fast;
 mod key;
 mod legacy;
 mod parquet;
+mod people;
 mod ts;
 
 use std::path::{Path, PathBuf};
@@ -183,15 +185,18 @@ fn lookup_rows(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// None when the dataset is outside this layout's limits.
-fn lookups(data: &Path) -> Option<Lookups> {
-    // About one long ID per 400 input bytes at most, for the generator's mix.
+fn lookups(data: &Path, threads: usize) -> Option<Lookups> {
+    // About one long ID per 2400 input bytes for the generator's mix (see IDEA-1b).
     let input: u64 = ["links", "events", "clicks"]
         .iter()
         .flat_map(|d| csv::list(&data.join(d)))
         .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .sum();
-    let ids = Interner::with_capacity((input / 400) as usize);
+    let ids = Interner::with_capacity((input / 1000) as usize);
+    // IDEA-1: first touch of the ID table is a write (no zero-page mappings).
+    // IDEA-1b: the table holds 3x fewer slots than before (about 8% full at 20M events).
+    ids.prefault(threads);
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let window_start = manifest_time(&manifest, "window_start");
     let window_end = manifest_time(&manifest, "window_end");
@@ -1221,7 +1226,12 @@ fn sessions_bucket(events: &[&[Event]], clicks: &[&[Click]], lk: &Lookups, st: &
     }
 }
 
-fn write_tables(out: &Path, outputs: &[Output], counts: &[Counts], lk: &Lookups, threads: usize) {
+/// Bits needed to write `v` (at least one).
+fn bit_width(v: usize) -> u32 {
+    usize::BITS - v.max(1).leading_zeros()
+}
+
+fn write_tables(out: &Path, outputs: &[Output], lk: &Lookups, threads: usize) {
     let user_dir = out.join("user_daily");
     let campaign_dir = out.join("campaign_daily");
     std::fs::create_dir_all(&user_dir).unwrap();
@@ -1246,22 +1256,44 @@ fn write_tables(out: &Path, outputs: &[Output], counts: &[Counts], lk: &Lookups,
     if rows_in > 0 || pieces.is_empty() {
         pieces.push((rows_in, parts));
     }
+    // The category names as a PLAIN dictionary page, shared by every file,
+    // and the bit width of an index into it.
+    let mut category_dict = Vec::new();
+    for name in &lk.categories {
+        category_dict.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        category_dict.extend_from_slice(name);
+    }
+    let category_width = bit_width(lk.categories.len() - 1);
     #[derive(Default)]
     struct Columns {
-        ids: Vec<u8>,
+        /// One dictionary entry (a PLAIN name) per run of rows of one person.
+        names: Vec<u8>,
+        /// Rows in each run.
+        runs: Vec<u32>,
+        name_indices: Vec<u8>,
         day: Vec<i32>,
         sessions: Vec<u32>,
         events: Vec<u32>,
         revenue: Vec<i64>,
         levels: Vec<u8>,
-        top: Vec<u8>,
+        /// The category of each row that has one.
+        present: Vec<u8>,
+        top_indices: Vec<u8>,
     }
-    run(threads, pieces.len(), Columns::default, |c, p| {
+    // Task 0 merges the counts and writes campaign_daily while the other
+    // threads write the user files.
+    run(threads, pieces.len() + 1, Columns::default, |c, task| {
+        if task == 0 {
+            write_campaigns(&campaign_dir, outputs, lk);
+            return;
+        }
+        let p = task - 1;
         let (n, parts) = &pieces[p];
-        let Columns { ids, day, sessions, events, revenue, levels, top } = c;
-        for v in [&mut *ids, &mut *top, &mut *levels] {
+        let Columns { names, runs, name_indices, day, sessions, events, revenue, levels, present, top_indices } = c;
+        for v in [&mut *names, &mut *levels, &mut *present] {
             v.clear();
         }
+        runs.clear();
         day.clear();
         sessions.clear();
         events.clear();
@@ -1283,40 +1315,98 @@ fn write_tables(out: &Path, outputs: &[Output], counts: &[Counts], lk: &Lookups,
         let bits_at = levels.len();
         levels.resize(bits_at + groups, 0);
         let mut i = 0;
+        let mut last = None;
         for r in parts.iter().flat_map(|s| s.iter()) {
-            let start = ids.len();
-            ids.extend_from_slice(&[0; 4]);
-            lk.ids.bytes(r.person, ids);
-            let len = (ids.len() - start - 4) as u32;
-            ids[start..start + 4].copy_from_slice(&len.to_le_bytes());
+            // A person's days are consecutive rows: one dictionary entry for all of them.
+            if last != Some(r.person) {
+                last = Some(r.person);
+                let start = names.len();
+                names.extend_from_slice(&[0; 4]);
+                lk.ids.bytes(r.person, names);
+                let len = (names.len() - start - 4) as u32;
+                names[start..start + 4].copy_from_slice(&len.to_le_bytes());
+                runs.push(0);
+            }
+            *runs.last_mut().unwrap() += 1;
             day.push(r.day);
             sessions.push(r.sessions);
             events.push(r.events);
             revenue.push(r.revenue as i64);
             if r.top != NO_CATEGORY {
-                let name = &lk.categories[r.top as usize];
-                top.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                top.extend_from_slice(name);
+                present.push(r.top);
                 levels[bits_at + i / 8] |= 1 << (i % 8);
             }
             i += 1;
         }
         let level_bytes = (levels.len() - 4) as u32;
         levels[..4].copy_from_slice(&level_bytes.to_le_bytes());
+        let rows = *n;
+        let path = user_dir.join(format!("part-{p:05}.parquet"));
+        if rows == 0 {
+            // No rows, no dictionaries: empty PLAIN pages.
+            parquet::write(
+                &path,
+                &[
+                    Column { name: "user_id", values: Values::PlainStr { rows, bytes: &[] } },
+                    Column { name: "day", values: Values::Date(day) },
+                    Column { name: "sessions", values: Values::U32(sessions) },
+                    Column { name: "events", values: Values::U32(events) },
+                    Column { name: "revenue_cents", values: Values::I64(revenue) },
+                    Column { name: "top_category", values: Values::OptStrPage { rows, levels, values: &[] } },
+                ],
+            )
+            .expect("write user_daily");
+            return;
+        }
+
+        // Dictionary indices: runs of one entry per person's rows; a bit-packed
+        // run for the categories of the rows that have one.
+        let name_width = bit_width(runs.len() - 1);
+        name_indices.clear();
+        name_indices.push(name_width as u8);
+        for (entry, &len) in runs.iter().enumerate() {
+            parquet::rle_run(name_indices, len as usize, entry as u32, name_width.div_ceil(8) as usize);
+        }
+        top_indices.clear();
+        top_indices.push(category_width as u8);
+        if !present.is_empty() {
+            parquet::bit_packed_run(top_indices, present, category_width);
+        }
         parquet::write(
-            &user_dir.join(format!("part-{p:05}.parquet")),
+            &path,
             &[
-                Column { name: "user_id", values: Values::PlainStr { rows: *n, bytes: ids } },
+                Column { name: "user_id", values: Values::DictStr { rows, entries: runs.len(), dict: names, indices: name_indices } },
                 Column { name: "day", values: Values::Date(day) },
                 Column { name: "sessions", values: Values::U32(sessions) },
                 Column { name: "events", values: Values::U32(events) },
                 Column { name: "revenue_cents", values: Values::I64(revenue) },
-                Column { name: "top_category", values: Values::OptStrPage { rows: *n, levels, values: top } },
+                Column {
+                    name: "top_category",
+                    values: Values::OptDictStr {
+                        rows,
+                        entries: lk.categories.len(),
+                        dict: &category_dict,
+                        levels,
+                        indices: top_indices,
+                    },
+                },
             ],
         )
         .expect("write user_daily");
     });
+}
 
+/// Merges the per-thread counts and writes campaign_daily.
+fn write_campaigns(dir: &Path, outputs: &[Output], lk: &Lookups) {
+    let mut counts = vec![Counts::default(); (lk.channels.len() + 1) * lk.days];
+    for o in outputs {
+        for (total, c) in counts.iter_mut().zip(&o.counts) {
+            total.sessions += c.sessions;
+            total.purchasing += c.purchasing;
+            total.revenue += c.revenue;
+            total.assisted += c.assisted;
+        }
+    }
     let (mut id, mut channel, mut day) = (Vec::new(), Vec::new(), Vec::new());
     let (mut sessions, mut purchasing, mut revenue, mut assisted) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let organic = lk.channels.len();
@@ -1341,7 +1431,7 @@ fn write_tables(out: &Path, outputs: &[Output], counts: &[Counts], lk: &Lookups,
         }
     }
     parquet::write(
-        &campaign_dir.join("part-00000.parquet"),
+        &dir.join("part-00000.parquet"),
         &[
             Column { name: "campaign_id", values: Values::Str(&id) },
             Column { name: "channel", values: Values::Str(&channel) },
@@ -1383,12 +1473,15 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
         .max(1);
 
-    let Some(lk) = lookups(&data) else {
+    let Some(lk) = lookups(&data, threads) else {
         eprintln!("dataset outside the fast layout's limits: general pipeline");
         legacy::run_legacy(data, out, threads);
         return;
     };
     lap("lookups");
+    if std::env::var_os("SESSIONS_GENERAL").is_none() {
+        fast::execute(&lk, &data, &out, threads, &clock);
+    }
 
     // 1. Parse. Link chunks come first so the names are ready early.
     let link_files = mapped_csvs(&data.join("links"));
@@ -1485,7 +1578,7 @@ fn main() {
                 let b = order[t];
                 let copies = std::mem::take(&mut *by_bucket[b].lock().unwrap());
                 let mut batch = Batch::new((0u32, 0u32));
-                let mut sink = |person: Key, (ts, pc): (u32, u32)| events[bucket(person)].push(slab, Event { person, ts, pc });
+                let mut sink = |person: Key, (ts, pc): (u32, u32)| { events[bucket(person)].push(slab, Event { person, ts, pc }); };
                 let slices: Vec<&[Raw]> = copies.iter().flat_map(|c| c.slices()).collect();
                 dedup.winners(sizes[b], &slices, |e| {
                     if e.ts != INVALID {
@@ -1500,7 +1593,7 @@ fn main() {
             } else {
                 let mut batch = Batch::new((0u64, 0u32, 0u32));
                 let mut sink = |person: Key, (cid, ts, campaign): (Key, u32, u32)| {
-                    clicks[bucket(person)].push(slab, Click { person, cid, ts, campaign })
+                    clicks[bucket(person)].push(slab, Click { person, cid, ts, campaign });
                 };
                 for c in click_slices[t - BUCKETS] {
                     batch.push(&names, c.person, (c.cid, c.ts, c.campaign), &mut sink);
@@ -1544,16 +1637,7 @@ fn main() {
     lap("sessions");
 
     let outputs: Vec<Output> = results.into_iter().map(|s| s.out).collect();
-    let mut counts = vec![Counts::default(); slots];
-    for o in &outputs {
-        for (total, c) in counts.iter_mut().zip(&o.counts) {
-            total.sessions += c.sessions;
-            total.purchasing += c.purchasing;
-            total.revenue += c.revenue;
-            total.assisted += c.assisted;
-        }
-    }
-    write_tables(&out, &outputs, &counts, &lk, threads);
+    write_tables(&out, &outputs, &lk, threads);
     lap("write");
     // Everything is written and closed: skip freeing the buffers.
     std::process::exit(0);
@@ -1665,7 +1749,7 @@ fn lookups_number_categories_in_byte_order() {
     )
     .unwrap();
     std::fs::write(dir.join("campaigns.csv"), "campaign_id,channel\nc_1,email\n").unwrap();
-    let lk = lookups(&dir).unwrap();
+    let lk = lookups(&dir, 2).unwrap();
     let names: Vec<&[u8]> = lk.categories.iter().map(|c| c.as_slice()).collect();
     // "" (p4) sorts first, then byte order. Categories of repeated rows count.
     assert_eq!(names, [&b""[..], b"Books", b"books", b"games", b"toys", b"unknown"]);

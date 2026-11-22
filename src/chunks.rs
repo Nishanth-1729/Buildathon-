@@ -9,7 +9,7 @@
 use std::mem::size_of;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -21,6 +21,29 @@ const MAP_PRIVATE_ANONYMOUS: i32 = 0x2 | 0x20;
 const MADV_HUGEPAGE: i32 = 14;
 const HUGE: usize = 2 << 20;
 const REFILL: usize = 32 << 20;
+/// Every slab is carved from one reserved range, so a record in any chunk is
+/// named by its offset from `region_base()`, which fits 34 bits.
+const REGION: usize = 64 << 30;
+const MAP_NORESERVE: i32 = 0x4000;
+
+static REGION_ONCE: Once = Once::new();
+static REGION_BASE: AtomicUsize = AtomicUsize::new(0);
+static REGION_NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// The 2 MB aligned start of the slab range (reserved on first use).
+pub fn region_base() -> usize {
+    REGION_ONCE.call_once(|| {
+        // Safety: a fresh anonymous reservation; pages are only touched when used.
+        unsafe {
+            let p = mmap(null_mut(), REGION + HUGE, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            assert!(p as isize != -1, "mmap slab region");
+            let start = (p as usize + HUGE - 1) & !(HUGE - 1);
+            madvise(start as *mut u8, REGION, MADV_HUGEPAGE);
+            REGION_BASE.store(start, Relaxed);
+        }
+    });
+    REGION_BASE.load(Relaxed)
+}
 /// A multiple of 64, so every chunk starts on a cache line.
 pub const CHUNK_BYTES: usize = 32 << 10;
 
@@ -46,15 +69,11 @@ impl Slab {
 
     #[cold]
     fn refill(&mut self) {
-        // Safety: an anonymous private mapping; the aligned part is ours.
-        unsafe {
-            let p = mmap(null_mut(), REFILL + HUGE, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, -1, 0);
-            assert!(p as isize != -1, "mmap slab");
-            let start = (p as usize + HUGE - 1) & !(HUGE - 1);
-            madvise(start as *mut u8, REFILL, MADV_HUGEPAGE);
-            self.cur = start;
-            self.end = start + REFILL;
-        }
+        let at = REGION_NEXT.fetch_add(REFILL, Relaxed);
+        assert!(at + REFILL <= REGION, "slab region full");
+        let start = region_base() + at;
+        self.cur = start;
+        self.end = start + REFILL;
     }
 
     #[inline]
@@ -101,15 +120,18 @@ impl<T: Copy> Bucket<T> {
         Bucket { chunks: Vec::new(), cur: null_mut(), end: null_mut() }
     }
 
+    /// Appends `v`; returns where it was stored (the address never changes).
     #[inline(always)]
-    pub fn push(&mut self, slab: &mut Slab, v: T) {
+    pub fn push(&mut self, slab: &mut Slab, v: T) -> *mut T {
         if self.cur == self.end {
             self.grow(slab);
         }
         // Safety: cur < end, inside the current chunk.
         unsafe {
-            self.cur.write(v);
-            self.cur = self.cur.add(1);
+            let at = self.cur;
+            at.write(v);
+            self.cur = at.add(1);
+            at
         }
     }
 

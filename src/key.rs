@@ -16,7 +16,7 @@ const ASCII_LANES: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 /// lock-free one; the rest of the key is its index there.
 const LOCKED: Key = 1 << 62;
 /// Low 48 bits of a slot: the address of the record; high 16: a hash tag.
-const ADDRESS: u64 = (1 << 48) - 1;
+pub const ADDRESS: u64 = (1 << 48) - 1;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -40,26 +40,24 @@ fn reserve(bytes: usize) -> *mut u8 {
 /// threads in blocks. A record is a u32 length and the bytes; records are
 /// 4-byte aligned and never move, so a key can hold the address.
 const ARENA: usize = 64 << 30;
+/// Slots an ID may be probed through before it goes to the locked map.
+const MAX_PROBES: usize = 64;
 const BLOCK: usize = 64 << 10;
 
 thread_local! {
     /// The calling thread's current block: (next free, end).
     static BLOCK_AT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
-    /// Inserts the calling thread may still make before counting again.
-    static INSERTS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Long IDs go into an open-addressing table that threads search and add to
 /// without locks: a slot is written once, by compare-and-swap, with the
-/// address of a record already written. When the table gets crowded new
-/// IDs go to a locked map instead; IDs already in the table are still found
-/// there, as a probe only stops at an empty slot.
+/// address of a record already written. An ID whose first `MAX_PROBES` slots
+/// all hold other IDs goes to a locked map instead. A slot never changes once
+/// it is written, so that decision is the same for every thread at any time:
+/// one ID never gets two keys.
 pub struct Interner {
     slots: *const AtomicU64,
     mask: usize,
-    /// Inserts allowed into `slots` before it counts as crowded.
-    room: usize,
-    used: AtomicUsize,
     arena: usize,
     arena_next: AtomicUsize,
     locked: Mutex<Locked>,
@@ -96,7 +94,7 @@ impl Hasher for BytesHasher {
 }
 
 #[inline]
-fn hash_bytes(s: &[u8]) -> u64 {
+pub fn hash_bytes(s: &[u8]) -> u64 {
     let mut h = s.len() as u64;
     let mut words = s.chunks_exact(8);
     for w in &mut words {
@@ -113,7 +111,7 @@ fn hash_bytes(s: &[u8]) -> u64 {
 
 /// The bytes of the record at `address`.
 #[inline]
-fn record<'a>(address: usize) -> &'a [u8] {
+pub fn record<'a>(address: usize) -> &'a [u8] {
     // Safety: a record published in the table: a u32 length, then bytes.
     unsafe {
         let len = (address as *const u32).read() as usize;
@@ -122,40 +120,99 @@ fn record<'a>(address: usize) -> &'a [u8] {
 }
 
 impl Interner {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::with_capacity(1 << 16)
     }
 
-    /// A table for about `ids` long IDs before it counts as crowded.
+    /// A table for about `ids` long IDs; more are still correct, but slower.
     pub fn with_capacity(ids: usize) -> Self {
         let n = (ids.max(1 << 16) * 2).next_power_of_two();
         Interner {
             slots: reserve(n * 8) as *const AtomicU64,
             mask: n - 1,
-            room: n / 4 * 3 - 64 * 1024,
-            used: AtomicUsize::new(0),
             arena: reserve(ARENA) as usize,
             arena_next: AtomicUsize::new(0),
             locked: Mutex::new(Locked::default()),
         }
     }
 
+    /// Gives every page of the slot table its first touch as a write, on
+    /// `threads` threads. The lookups that follow would otherwise read pages
+    /// nobody has written yet: the kernel maps its shared zero page for
+    /// them, and the first insert into such a page has to unmap that from
+    /// every CPU that runs this process (one inter-processor interrupt per
+    /// 4 KB or 2 MB page), and leaves the table in small pages. Safe while
+    /// other threads use the table: a compare-and-swap of 0 for 0 changes
+    /// nothing, whatever the slot holds.
+    pub fn prefault(&self, threads: usize) {
+        const PAGE_SLOTS: usize = 4096 / 8;
+        const STRIP: usize = 64;
+        let pages = (self.mask + 1).div_ceil(PAGE_SLOTS);
+        let next = AtomicUsize::new(0);
+        let work = || loop {
+            let first = next.fetch_add(STRIP, Relaxed);
+            if first >= pages {
+                return;
+            }
+            for page in first..(first + STRIP).min(pages) {
+                // Safety: page * PAGE_SLOTS <= mask, inside the table.
+                let slot = unsafe { &*self.slots.add(page * PAGE_SLOTS) };
+                let _ = slot.compare_exchange(0, 0, Relaxed, Relaxed);
+            }
+        };
+        std::thread::scope(|scope| {
+            for _ in 1..threads.min(pages.div_ceil(STRIP)) {
+                scope.spawn(&work);
+            }
+            work();
+        });
+    }
+
     #[inline(always)]
     pub fn key(&self, s: &[u8]) -> Key {
-        if (8..=9).contains(&s.len()) {
-            let head = u64::from_be_bytes(s[..8].try_into().unwrap());
-            let tail = if s.len() == 9 { s[8] } else { 0 };
-            const LOW_BITS: u64 = 0x0101_0101_0101_0101;
-            let zero_lanes = head.wrapping_sub(LOW_BITS) & !head & !ASCII_LANES;
-            if (head | zero_lanes) & !ASCII_LANES == 0 && (s.len() == 8 || (1..128).contains(&tail)) {
-                return (pack(head) << 7) | tail as u64;
-            }
-        } else if s.len() < 8 && s.iter().all(|&b| (1..128).contains(&b)) {
-            let mut bytes = [0; 8];
-            bytes[..s.len()].copy_from_slice(s);
-            return pack(u64::from_be_bytes(bytes)) << 7;
+        match Self::pack_short(s) {
+            Some(k) => k,
+            None => self.intern(s),
         }
-        self.intern(s)
+    }
+
+    /// The packed key of `s` when it packs (at most nine bytes, none NUL or
+    /// above 127): the value `key` returns for such an ID. An ID of 4 to 7
+    /// bytes is read as two overlapping 4-byte words, so no byte past it is
+    /// touched and no loop runs.
+    #[inline(always)]
+    pub fn pack_short(s: &[u8]) -> Option<Key> {
+        const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+        const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+        let n = s.len();
+        if (8..=9).contains(&n) {
+            let head = u64::from_be_bytes(s[..8].try_into().unwrap());
+            let tail = if n == 9 { s[8] } else { 0 };
+            let zero_lanes = head.wrapping_sub(LOW_BITS) & !head & !ASCII_LANES;
+            if (head | zero_lanes) & !ASCII_LANES == 0 && (n == 8 || (1..128).contains(&tail)) {
+                return Some((pack(head) << 7) | tail as u64);
+            }
+            None
+        } else if (4..8).contains(&n) {
+            let lo = u32::from_le_bytes(s[..4].try_into().unwrap()) as u64;
+            let hi = u32::from_le_bytes(s[n - 4..].try_into().unwrap()) as u64;
+            // Byte i of w is s[i]; the bytes past the ID are zero.
+            let w = lo | (hi << (8 * (n - 4)));
+            // Fill them with 1s for the check: every byte must be 1..=127.
+            let c = w | (LOW_BITS & !((1u64 << (8 * n)) - 1));
+            if (c.wrapping_sub(LOW_BITS) & !c | c) & HIGH_BITS == 0 {
+                Some(pack(w.swap_bytes()) << 7)
+            } else {
+                None
+            }
+        } else if n < 4 && s.iter().all(|&b| (1..128).contains(&b)) {
+            let mut bytes = [0; 8];
+            bytes[..n].copy_from_slice(s);
+            Some(pack(u64::from_be_bytes(bytes)) << 7)
+        } else {
+            None
+        }
     }
 
     /// The key of an ID that is only compared for equality (an event ID): the
@@ -196,15 +253,12 @@ impl Interner {
         let tag = h & !ADDRESS;
         let mut i = h as usize & self.mask;
         let mut mine = 0usize;
-        loop {
+        for _ in 0..MAX_PROBES {
             // Safety: i <= mask, inside the table.
             let slot = unsafe { &*self.slots.add(i) };
             let v = slot.load(Acquire);
             if v == 0 {
                 if mine == 0 {
-                    if self.crowded() {
-                        return self.intern_locked(s);
-                    }
                     mine = self.copy(s);
                 }
                 match slot.compare_exchange(0, tag | mine as u64, Release, Acquire) {
@@ -221,30 +275,11 @@ impl Interner {
             }
             i = (i + 1) & self.mask;
         }
-    }
-
-    /// Counts an insert; true when the table is too full to take it.
-    /// Threads count in batches, so the table can overshoot `room` by a
-    /// batch per thread, which the slack above `room` absorbs.
-    #[inline]
-    fn crowded(&self) -> bool {
-        const BATCH: usize = 1024;
-        INSERTS.with(|n| {
-            let left = n.get();
-            if left != 0 {
-                n.set(left - 1);
-                return false;
-            }
-            if self.used.fetch_add(BATCH, Relaxed) >= self.room {
-                return true;
-            }
-            n.set(BATCH - 1);
-            false
-        })
+        self.intern_locked(s)
     }
 
     /// Copies `s` into the arena as a record; returns its address.
-    fn copy(&self, s: &[u8]) -> usize {
+    pub fn copy(&self, s: &[u8]) -> usize {
         let need = (4 + s.len() + 3) & !3;
         let at = BLOCK_AT.with(|b| {
             let (mut next, mut end) = b.get();
@@ -398,6 +433,39 @@ mod tests {
 }
 
 #[cfg(test)]
+mod pack_tests {
+    use super::*;
+
+    /// The definition: at most nine bytes, each 1..=127, seven bits a byte.
+    fn reference(s: &[u8]) -> Option<Key> {
+        if s.len() > 9 || s.iter().any(|&b| !(1..128).contains(&b)) {
+            return None;
+        }
+        let mut k = 0u64;
+        for i in 0..9 {
+            k = (k << 7) | s.get(i).copied().unwrap_or(0) as u64;
+        }
+        Some(k)
+    }
+
+    #[test]
+    fn pack_short_matches_the_definition() {
+        let mut state = 12345u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let alphabets: [&[u8]; 3] = [b"abcxyz019", &[0, 1, 127, 128, 255, b'a'], &[b'a', b'b', 0]];
+        for round in 0..400_000 {
+            let len = next() % 12;
+            let alphabet = alphabets[round % 3];
+            let s: Vec<u8> = (0..len).map(|_| alphabet[next() % alphabet.len()]).collect();
+            assert_eq!(Interner::pack_short(&s), reference(&s), "{s:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod intern_tests {
     use super::Interner;
 
@@ -446,6 +514,41 @@ mod hashed_tests {
             let key = ids.key_hashed(s.as_bytes());
             assert_eq!(key, ids.key_hashed(s.as_bytes()));
             assert!(seen.insert(key), "collision at {i}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod overfull_tests {
+    use super::Interner;
+
+    /// More distinct long IDs than the table has slots, from several threads at
+    /// once: every ID still gets one key, the same one on every thread.
+    #[test]
+    fn one_key_per_id_when_the_table_is_full() {
+        let ids = Interner::new();
+        let make = |i: usize| format!("user-with-a-long-name-{i:08}").into_bytes();
+        let total = 400_000;
+        let results: Vec<Vec<u64>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    let ids = &ids;
+                    s.spawn(move || (0..total).map(|i| ids.key(&make(i))).collect::<Vec<_>>())
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for t in 0..4 {
+            for i in 0..total {
+                assert_eq!(results[t][i], results[0][i], "id {i} on thread {t}");
+            }
+        }
+        for id in (0..total).step_by(997) {
+            let k = ids.key(&make(id));
+            assert_eq!(k, results[0][id]);
+            let mut got = Vec::new();
+            ids.bytes(k, &mut got);
+            assert_eq!(got, make(id));
         }
     }
 }
