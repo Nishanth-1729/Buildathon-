@@ -649,6 +649,8 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
     const SPAN: usize = 1 << 15;
     run(threads, people.capacity().div_ceil(SPAN), || (), |_, t| people.settle(t * SPAN, ((t + 1) * SPAN).min(people.capacity())));
     lap(&format!("links: {} IDs in 2^{bits} slots", people.len()));
+    // EXPERIMENT (phase timing probe, not for the final): sleep 100 x the elapsed seconds here.
+    std::thread::sleep(std::time::Duration::from_micros((clock.elapsed().as_secs_f64() * 100_000_000.0) as u64));
 
     // 2. Events and clicks.
     let event_files = mapped_csvs(&data.join("events"));
