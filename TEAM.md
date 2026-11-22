@@ -2,4 +2,4 @@
 
 Name: Epsilon
 Members: Person A, Person B
-Engine: Rust (custom, no dependencies)
+Engine: Rust (custom; hashbrown + ahash)

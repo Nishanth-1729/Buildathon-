@@ -1,149 +1,60 @@
-//! Bucket lists made of fixed-size chunks carved from huge-page slabs.
-//!
-//! A `Vec` per bucket grows by doubling: every regrowth copies and faults in
-//! fresh 4 KB pages. A bucket here only ever appends: when its chunk is full
-//! it takes the next 32 KB chunk of its thread's slab, a 32 MB mapping that
-//! asks for transparent huge pages. Slab memory is never returned; the
-//! process exits when the tables are written.
-
-use std::mem::size_of;
-use std::ptr::null_mut;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::Mutex;
+//! Memory for the bucket lists: capacity reserved once (no regrowth copies),
+//! backed by huge pages and pre-faulted, plus non-temporal store helpers.
 
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
-const PROT_READ_WRITE: i32 = 3;
-const MAP_PRIVATE_ANONYMOUS: i32 = 0x2 | 0x20;
 const MADV_HUGEPAGE: i32 = 14;
-const HUGE: usize = 2 << 20;
-const REFILL: usize = 32 << 20;
-/// A multiple of 64, so every chunk starts on a cache line.
-pub const CHUNK_BYTES: usize = 32 << 10;
+const MADV_POPULATE_WRITE: i32 = 22; // Linux 5.14+; older kernels ignore it (EINVAL)
+const PAGE: usize = 4096;
 
-/// Chunks whose contents are dead (see `Bucket::recycle`), for any thread to
-/// reuse instead of faulting in fresh, zeroed memory.
-static POOL: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-static POOL_LEN: AtomicUsize = AtomicUsize::new(0);
-/// How many pooled chunks a thread takes at a time.
-const POOL_TAKE: usize = 16;
-
-/// One thread's supply of chunks.
-pub struct Slab {
-    cur: usize,
-    end: usize,
-    /// Recycled chunks taken from the pool.
-    spare: Vec<usize>,
-}
-
-impl Slab {
-    pub fn new() -> Self {
-        Slab { cur: 0, end: 0, spare: Vec::new() }
-    }
-
-    #[cold]
-    fn refill(&mut self) {
-        // Safety: an anonymous private mapping; the aligned part is ours.
+/// A Vec with room for `n` items reserved up front, so pushes never copy.
+/// The whole pages inside the allocation are asked for as huge pages and
+/// faulted in now, not on first write in the hot loop.
+pub fn reserved<T>(n: usize) -> Vec<T> {
+    let v: Vec<T> = Vec::with_capacity(n);
+    let bytes = v.capacity() * std::mem::size_of::<T>();
+    let start = (v.as_ptr() as usize + PAGE - 1) & !(PAGE - 1);
+    let end = (v.as_ptr() as usize + bytes) & !(PAGE - 1);
+    if end > start {
+        // Safety: [start, end) lies inside the Vec's own allocation.
         unsafe {
-            let p = mmap(null_mut(), REFILL + HUGE, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, -1, 0);
-            assert!(p as isize != -1, "mmap slab");
-            let start = (p as usize + HUGE - 1) & !(HUGE - 1);
-            madvise(start as *mut u8, REFILL, MADV_HUGEPAGE);
-            self.cur = start;
-            self.end = start + REFILL;
+            // 1. Request 2MB Huge Pages (reduces TLB misses by 512x)
+            madvise(start as *mut u8, end - start, MADV_HUGEPAGE);
+            // 2. FORCE the kernel to allocate physical RAM NOW.
+            // This eliminates page faults during the hot parsing loop.
+            madvise(start as *mut u8, end - start, MADV_POPULATE_WRITE);
         }
     }
+    v
+}
 
-    #[inline]
-    fn take(&mut self) -> *mut u8 {
-        if let Some(p) = self.spare.pop() {
-            return p as *mut u8;
-        }
-        if POOL_LEN.load(Relaxed) != 0 {
-            let mut pool = POOL.lock().unwrap();
-            let n = pool.len().min(POOL_TAKE);
-            let at = pool.len() - n;
-            self.spare.extend(pool.drain(at..));
-            POOL_LEN.store(pool.len(), Relaxed);
-            drop(pool);
-            if let Some(p) = self.spare.pop() {
-                return p as *mut u8;
-            }
-        }
-        if self.cur + CHUNK_BYTES > self.end {
-            self.refill();
-        }
-        let p = self.cur;
-        self.cur += CHUNK_BYTES;
-        p as *mut u8
+/// Writes a 64-byte block directly to RAM, bypassing the CPU cache.
+/// This prevents cache pollution when appending millions of records to buckets.
+#[allow(dead_code)]
+#[inline(always)]
+pub unsafe fn stream_64_nt(dst: *mut u8, src: *const u8) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        use std::arch::x86_64::*;
+        // Two 32-byte non-temporal stores
+        _mm256_stream_si256(dst.cast(), _mm256_loadu_si256(src.cast()));
+        _mm256_stream_si256(dst.add(32).cast(), _mm256_loadu_si256(src.add(32).cast()));
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        std::ptr::copy_nonoverlapping(src, dst, 64);
     }
 }
 
-/// An append-only list of `T`: full chunks, then one partly filled chunk.
-pub struct Bucket<T> {
-    chunks: Vec<*mut T>,
-    cur: *mut T,
-    end: *mut T,
-}
-
-// The chunks belong to the bucket alone (slab memory is never reused), and
-// are only read through `&Bucket` once appending is over.
-unsafe impl<T: Send> Send for Bucket<T> {}
-unsafe impl<T: Sync> Sync for Bucket<T> {}
-
-impl<T: Copy> Bucket<T> {
-    const CAP: usize = CHUNK_BYTES / size_of::<T>();
-
-    pub fn new() -> Self {
-        Bucket { chunks: Vec::new(), cur: null_mut(), end: null_mut() }
-    }
-
-    #[inline(always)]
-    pub fn push(&mut self, slab: &mut Slab, v: T) {
-        if self.cur == self.end {
-            self.grow(slab);
-        }
-        // Safety: cur < end, inside the current chunk.
-        unsafe {
-            self.cur.write(v);
-            self.cur = self.cur.add(1);
-        }
-    }
-
-    #[cold]
-    fn grow(&mut self, slab: &mut Slab) {
-        let p = slab.take() as *mut T;
-        self.chunks.push(p);
-        self.cur = p;
-        // Safety: a chunk holds CAP elements.
-        self.end = unsafe { p.add(Self::CAP) };
-    }
-
-    /// Hands the chunks to the pool: for a list nothing reads any more.
-    pub fn recycle(self) {
-        let mut pool = POOL.lock().unwrap();
-        pool.extend(self.chunks.iter().map(|&p| p as usize));
-        POOL_LEN.store(pool.len(), Relaxed);
-    }
-
-    pub fn len(&self) -> usize {
-        match self.chunks.last() {
-            None => 0,
-            Some(&last) => (self.chunks.len() - 1) * Self::CAP + (self.cur as usize - last as usize) / size_of::<T>(),
-        }
-    }
-
-    /// The elements, one slice per chunk, in order.
-    pub fn slices(&self) -> impl Iterator<Item = &[T]> + Clone + '_ {
-        let n = self.chunks.len();
-        let cur = self.cur as usize;
-        self.chunks.iter().enumerate().map(move |(i, &p)| {
-            let len = if i + 1 == n { (cur - p as usize) / size_of::<T>() } else { Self::CAP };
-            // Safety: the first `len` elements of the chunk were written.
-            unsafe { std::slice::from_raw_parts(p, len) }
-        })
+/// Memory barrier to ensure all non-temporal stores are globally visible
+/// before the next phase (sessionization) reads the data.
+#[inline(always)]
+pub fn sfence() {
+    #[cfg(target_arch = "x86_64")]
+    // Safety: a store fence has no preconditions.
+    unsafe {
+        std::arch::x86_64::_mm_sfence();
     }
 }
