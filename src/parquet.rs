@@ -5,10 +5,16 @@ use std::io::Write;
 
 pub enum Values<'a> {
     I64(&'a [i64]),
+    U32(&'a [u32]),
+    /// Pre-encoded PLAIN strings (u32 length followed by bytes per value).
+    PlainStr { rows: usize, bytes: &'a [u8] },
     /// Parquet DATE: days since the epoch.
     Date(&'a [i32]),
     Str(&'a [&'a [u8]]),
     OptStr(&'a [Option<&'a [u8]>]),
+    /// A pre-encoded optional string page: `levels` is the 4-byte length and
+    /// the definition levels, `values` the PLAIN strings of the present rows.
+    OptStrPage { rows: usize, levels: &'a [u8], values: &'a [u8] },
 }
 
 pub struct Column<'a> {
@@ -25,6 +31,7 @@ const PLAIN: i32 = 0;
 const RLE: i32 = 3;
 const CONVERTED_UTF8: i32 = 0;
 const CONVERTED_DATE: i32 = 6;
+const CONVERTED_U32: i32 = 13;
 
 /// Thrift compact protocol, just the parts the footer needs.
 struct Thrift {
@@ -102,24 +109,36 @@ struct ChunkMeta {
 pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> {
     let rows = match &columns[0].values {
         Values::I64(v) => v.len(),
+        Values::U32(v) => v.len(),
+        Values::PlainStr { rows, .. } => *rows,
         Values::Date(v) => v.len(),
         Values::Str(v) => v.len(),
         Values::OptStr(v) => v.len(),
+        Values::OptStrPage { rows, .. } => *rows,
     };
-    let mut out: Vec<u8> = Vec::with_capacity(rows * 64 + 1024);
-    out.extend_from_slice(b"PAR1");
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(b"PAR1")?;
+    let mut offset = 4i64;
     let mut metas = Vec::new();
     let mut page = Vec::new();
     for column in columns {
         page.clear();
-        match &column.values {
-            Values::I64(v) => v.iter().for_each(|x| page.extend_from_slice(&x.to_le_bytes())),
-            Values::Date(v) => v.iter().for_each(|x| page.extend_from_slice(&x.to_le_bytes())),
+        let mut tail: &[u8] = &[];
+        let body = match &column.values {
+            Values::I64(v) => unsafe { plain_numbers(v) },
+            Values::U32(v) => unsafe { plain_numbers(v) },
+            Values::Date(v) => unsafe { plain_numbers(v) },
+            Values::PlainStr { bytes, .. } => *bytes,
+            Values::OptStrPage { levels, values, .. } => {
+                tail = values;
+                *levels
+            }
             Values::Str(v) => {
                 for s in v.iter() {
                     page.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     page.extend_from_slice(s);
                 }
+                &page
             }
             Values::OptStr(v) => {
                 // Definition levels: RLE/bit-packed hybrid, bit width 1, one
@@ -140,12 +159,13 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
                     page.extend_from_slice(&(s.len() as u32).to_le_bytes());
                     page.extend_from_slice(s);
                 }
+                &page
             }
-        }
+        };
         let mut h = Thrift::new();
         h.i32(1, 0); // DATA_PAGE
-        h.i32(2, page.len() as i32);
-        h.i32(3, page.len() as i32);
+        h.i32(2, (body.len() + tail.len()) as i32);
+        h.i32(3, (body.len() + tail.len()) as i32);
         h.begin_struct(5);
         h.i32(1, rows as i32);
         h.i32(2, PLAIN);
@@ -153,15 +173,17 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
         h.i32(4, RLE);
         h.end_struct();
         h.buf.push(0);
-        let offset = out.len() as i64;
-        out.extend_from_slice(&h.buf);
-        out.extend_from_slice(&page);
-        metas.push(ChunkMeta { offset, size: (h.buf.len() + page.len()) as i64, count: rows as i64 });
+        file.write_all(&h.buf)?;
+        file.write_all(body)?;
+        file.write_all(tail)?;
+        let size = (h.buf.len() + body.len() + tail.len()) as i64;
+        metas.push(ChunkMeta { offset, size, count: rows as i64 });
+        offset += size;
     }
 
     let physical = |v: &Values| match v {
         Values::I64(_) => INT64,
-        Values::Date(_) => INT32,
+        Values::Date(_) | Values::U32(_) => INT32,
         _ => BYTE_ARRAY,
     };
     let mut f = Thrift::new();
@@ -174,10 +196,10 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
     for column in columns {
         f.begin_element();
         f.i32(1, physical(&column.values));
-        f.i32(3, if matches!(column.values, Values::OptStr(_)) { OPTIONAL } else { REQUIRED });
+        f.i32(3, if matches!(column.values, Values::OptStr(_) | Values::OptStrPage { .. }) { OPTIONAL } else { REQUIRED });
         f.binary(4, column.name.as_bytes());
         match column.values {
-            Values::Str(_) | Values::OptStr(_) => {
+            Values::Str(_) | Values::OptStr(_) | Values::OptStrPage { .. } | Values::PlainStr { .. } => {
                 f.i32(6, CONVERTED_UTF8);
                 f.begin_struct(10);
                 f.begin_struct(1); // StringType
@@ -188,6 +210,16 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
                 f.i32(6, CONVERTED_DATE);
                 f.begin_struct(10);
                 f.begin_struct(6); // DateType
+                f.end_struct();
+                f.end_struct();
+            }
+            Values::U32(_) => {
+                f.i32(6, CONVERTED_U32);
+                f.begin_struct(10);
+                f.begin_struct(10); // IntType
+                f.header(1, 3); // BYTE
+                f.buf.push(32);
+                f.header(2, 2); // false
                 f.end_struct();
                 f.end_struct();
             }
@@ -224,8 +256,15 @@ pub fn write(path: &std::path::Path, columns: &[Column]) -> std::io::Result<()> 
     f.binary(6, b"shopping-sessions");
     f.buf.push(0);
 
-    out.extend_from_slice(&f.buf);
-    out.extend_from_slice(&(f.buf.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    std::fs::File::create(path)?.write_all(&out)
+    f.buf.extend_from_slice(&(f.buf.len() as u32).to_le_bytes());
+    f.buf.extend_from_slice(b"PAR1");
+    file.write_all(&f.buf)
+}
+
+/// The scorer target is little-endian. PLAIN integers are stored as their
+/// native bytes. The caller must pass i32, u32 or i64, which have no padding.
+#[cfg(target_endian = "little")]
+unsafe fn plain_numbers<T: Copy>(values: &[T]) -> &[u8] {
+    // Callers pass slices of i32, u32 or i64, with no padding.
+    unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
 }

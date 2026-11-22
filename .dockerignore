@@ -4,3 +4,8 @@
 !Cargo.lock
 !.cargo
 !src
+!scripts
+scripts/*
+!scripts/build_pgo.sh
+!scripts/pgo_train.rs
+!scripts/train_public.sh

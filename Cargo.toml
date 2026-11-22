@@ -4,9 +4,8 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# No dependencies on purpose: the image builds offline in seconds.
 [dependencies]
-hashbrown = { version = "0.14", features = ["ahash"] }
-ahash = "0.8"
 
 [profile.release]
 opt-level = 3
