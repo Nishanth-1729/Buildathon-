@@ -284,23 +284,26 @@ fn parse_click(f: &[&[u8]; 4], cx: &Cx, st: &mut Shard) {
         },
     };
     let id = cx.people.locate(f[1]);
-    st.push::<false>(cx, Pend { a: click_key(f[0]), id, ts: (ts - lk.base) as u32, x: campaign, ingest: 0 });
+    st.push::<false>(cx, Pend { a: click_key(&lk.ids, f[0]), id, ts: (ts - lk.base) as u32, x: campaign, ingest: 0 });
 }
 
-/// The key of a click ID: its packed key when it packs, else a pointer to its
-/// bytes in the (still mapped) click file: INTERNED, the length in bits 48..56
-/// and the address below. Two copies of one click then have different keys, so
+/// The key of a click ID: its packed key when it packs, else a pointer to a
+/// copy of its bytes in the interner's arena: INTERNED, the length in bits
+/// 48..56 and the address below. (A pointer into the click file would fault in
+/// the whole file, 64 KB around every long ID that is compared, and its pages
+/// would have to be freed at the exit.) Two copies of one click then have different keys, so
 /// `click_id_eq` and `click_id_cmp` compare such keys by their bytes; that is
 /// only needed for clicks of one person at one timestamp.
 #[inline(always)]
-fn click_key(s: &[u8]) -> Key {
+fn click_key(ids: &Interner, s: &[u8]) -> Key {
     match Interner::pack_short(s) {
         Some(k) => k,
         None => {
             if s.len() > 255 {
                 fallback("a click ID of more than 255 bytes");
             }
-            INTERNED | (s.len() as u64) << 48 | s.as_ptr() as u64
+            // The record is a u32 length, then the bytes.
+            INTERNED | (s.len() as u64) << 48 | (ids.copy(s) + 4) as u64
         }
     }
 }
@@ -312,7 +315,7 @@ fn with_click_bytes<R>(ids: &Interner, k: Key, f: impl FnOnce(&[u8]) -> R) -> R 
         ids.bytes(k, &mut v);
         f(&v)
     } else {
-        // Safety: made by `click_key` from bytes of a click file that stays mapped.
+        // Safety: made by `click_key` from bytes copied into the arena, which is never freed.
         f(unsafe { std::slice::from_raw_parts((k & key::ADDRESS) as *const u8, (k >> 48 & 255) as usize) })
     }
 }
@@ -629,7 +632,7 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
 
     let cx = Cx { lk, people: People::new(bits), region: chunks::region_base(), pshift: bits - pbits, qshift: 64 - qbits };
     let people = &cx.people;
-    run(threads, people.pieces(), || (), |_, i| people.populate_piece(i));
+    people.populate(threads);
 
     // 1. Links.
     let link_files = mapped_csvs(&data.join("links"));
@@ -657,7 +660,7 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
     let event_chunks = chunks_sized(&event_files, chunk);
     let click_chunks = chunks_sized(&click_files, chunk);
     let ne = event_chunks.len();
-    let shards = run(
+    let mut shards = run(
         threads,
         ne + click_chunks.len(),
         || Shard::new(np, nq),
@@ -675,9 +678,9 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
             }
         },
     );
-    // The click files stay mapped: long click IDs point into them.
     drop((event_chunks, click_chunks));
     drop(event_files);
+    drop(click_files);
     lap(&format!("parse: {} IDs", people.len()));
 
     // 3. Duplicates.
@@ -702,6 +705,11 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
         }
     });
     drop(finders);
+    // The entries of the duplicate log are dead: the output rows reuse their
+    // memory instead of faulting in fresh, zeroed pages.
+    for shard in shards.iter_mut() {
+        std::mem::take(&mut shard.lg).into_iter().for_each(Bucket::recycle);
+    }
     lap("duplicates");
 
     // 4. Sessions per person partition, the largest first.
@@ -734,7 +742,12 @@ pub fn execute(lk: &Lookups, data: &Path, out: &Path, threads: usize, clock: &In
     let outputs: Vec<Output> = results.into_iter().map(|s| s.out).collect();
     write_tables(out, &outputs, lk, threads);
     lap("write");
-    // Everything is written and closed: skip freeing the buffers.
+    // Everything is written and closed. The exit would free a gigabyte of slabs,
+    // and the people table on one thread, 7 ms at 20M
+    // events; half the threads (one per core: more only fight over the kernel's
+    // page locks) do it faster.
+    chunks::release_all((threads / 2).max(1), &[people.extent()]);
+    // Skip freeing the buffers.
     std::process::exit(0);
 }
 
@@ -789,7 +802,7 @@ mod tests {
             long_a.clone(), long_a.clone(), long_b, vec![0xff, b'z'], vec![b'x', 0, b'y'], b"000000017".to_vec(),
             b"0000000170".to_vec(),
         ];
-        let keys: Vec<Key> = samples.iter().map(|s| click_key(s)).collect();
+        let keys: Vec<Key> = samples.iter().map(|s| click_key(&ids, s)).collect();
         let item = |key: Key, ts: u32| (ts as u128) << 96 | (key as u128) << 32;
         for (i, (a, ka)) in samples.iter().zip(&keys).enumerate() {
             for (j, (b, kb)) in samples.iter().zip(&keys).enumerate() {

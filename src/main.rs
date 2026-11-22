@@ -185,7 +185,7 @@ fn lookup_rows(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// None when the dataset is outside this layout's limits.
-fn lookups(data: &Path, threads: usize) -> Option<Lookups> {
+fn lookups(data: &Path, _threads: usize) -> Option<Lookups> {
     // About one long ID per 2400 input bytes for the generator's mix (see IDEA-1b).
     let input: u64 = ["links", "events", "clicks"]
         .iter()
@@ -194,9 +194,8 @@ fn lookups(data: &Path, threads: usize) -> Option<Lookups> {
         .map(|m| m.len())
         .sum();
     let ids = Interner::with_capacity((input / 1000) as usize);
-    // IDEA-1: first touch of the ID table is a write (no zero-page mappings).
-    // IDEA-1b: the table holds 3x fewer slots than before (about 8% full at 20M events).
-    ids.prefault(threads);
+    // The slot table is only used by the general pipeline (the one-shuffle layout
+    // keeps long IDs in its people table), which prefaults it in `main`.
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest.json");
     let window_start = manifest_time(&manifest, "window_start");
     let window_end = manifest_time(&manifest, "window_end");
@@ -1482,6 +1481,10 @@ fn main() {
     if std::env::var_os("SESSIONS_GENERAL").is_none() {
         fast::execute(&lk, &data, &out, threads, &clock);
     }
+
+    // IDEA-1: first touch of the ID table is a write (no zero-page mappings).
+    // IDEA-1b: the table holds 3x fewer slots than before (about 8% full at 20M events).
+    lk.ids.prefault(threads);
 
     // 1. Parse. Link chunks come first so the names are ready early.
     let link_files = mapped_csvs(&data.join("links"));

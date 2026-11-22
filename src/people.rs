@@ -81,6 +81,11 @@ impl People {
         People { slots, mask: n - 1, limit: n / 4 * 3, count: AtomicUsize::new(0) }
     }
 
+    /// Address and size in bytes of the table.
+    pub fn extent(&self) -> (usize, usize) {
+        (self.slots as usize, self.capacity() * SLOT_BYTES)
+    }
+
     pub fn capacity(&self) -> usize {
         self.mask + 1
     }
@@ -88,6 +93,35 @@ impl People {
     /// Number of 2 MB pieces of the table, for `populate_piece`.
     pub fn pieces(&self) -> usize {
         (self.capacity() * SLOT_BYTES).div_ceil(HUGE)
+    }
+
+    /// Faults in the whole table on `threads` threads. Every thread exists
+    /// before the first fault: while some threads fault, the kernel holds the
+    /// address space against a thread being created, which would then wait for
+    /// the whole table. The threads are started here, not by `run`, for that.
+    pub fn populate(&self, threads: usize) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let (go, next) = (AtomicBool::new(false), AtomicUsize::new(0));
+        let n = self.pieces();
+        let work = || {
+            while !go.load(Relaxed) {
+                std::hint::spin_loop();
+            }
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= n {
+                    return;
+                }
+                self.populate_piece(i);
+            }
+        };
+        std::thread::scope(|scope| {
+            for _ in 1..threads.min(n) {
+                scope.spawn(&work);
+            }
+            go.store(true, Relaxed);
+            work();
+        });
     }
 
     /// Touches piece `i` with a write, so that the kernel backs it with one

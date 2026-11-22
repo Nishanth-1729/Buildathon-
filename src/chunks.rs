@@ -44,6 +44,38 @@ pub fn region_base() -> usize {
     });
     REGION_BASE.load(Relaxed)
 }
+/// Gives the pages of every slab, and of the given ranges (address, length),
+/// back to the kernel on `threads` threads: for a process that is about to
+/// exit and will touch none of that memory again. The exit would otherwise
+/// free it all on one thread, the last to leave.
+pub fn release_all(threads: usize, ranges: &[(usize, usize)]) {
+    const MADV_DONTNEED: i32 = 4;
+    const STRIP: usize = 8 << 20;
+    let used = REGION_NEXT.load(Relaxed);
+    let base = REGION_BASE.load(Relaxed);
+    let mut jobs: Vec<(usize, usize)> = Vec::new();
+    if base != 0 {
+        jobs.extend((0..used).step_by(STRIP).map(|at| (base + at, STRIP.min(used - at))));
+    }
+    for &(start, len) in ranges {
+        let (a, z) = ((start + 4095) & !4095, (start + len) & !4095);
+        jobs.extend((a..z).step_by(STRIP).map(|at| (at, STRIP.min(z - at))));
+    }
+    let next = AtomicUsize::new(0);
+    let work = || loop {
+        let i = next.fetch_add(1, Relaxed);
+        let Some(&(at, len)) = jobs.get(i) else { return };
+        // Safety: inside a mapping of this process that nothing reads again.
+        unsafe { madvise(at as *mut u8, len, MADV_DONTNEED) };
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads.min(jobs.len()) {
+            scope.spawn(&work);
+        }
+        work();
+    });
+}
+
 /// A multiple of 64, so every chunk starts on a cache line.
 pub const CHUNK_BYTES: usize = 32 << 10;
 
